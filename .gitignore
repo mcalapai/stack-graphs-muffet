@@ -10,3 +10,6 @@ Cargo.lock
 
 # MacOS stuff
 .DS_Store
+
+# Other
+.vscode

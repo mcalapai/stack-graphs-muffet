@@ -535,7 +535,11 @@ impl Database {
 
     /// Returns the number of paths in this database that share the given end node.
     pub fn get_incoming_path_degree(&self, end_node: Handle<Node>) -> Degree {
-        self.incoming_paths[end_node]
+        // Old (panics if slot missing): self.incoming_paths[end_node]
+        self.incoming_paths
+            .get(end_node)
+            .copied()
+            .unwrap_or(Degree::Zero)
     }
 
     /// Determines which nodes in the stack graph are “local”, taking into account the partial
