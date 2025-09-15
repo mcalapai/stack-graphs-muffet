@@ -551,8 +551,8 @@ impl SQLiteReader {
         stats.file_loads += 1;
         let mut stmt = conn.prepare_cached("SELECT value FROM graphs WHERE file = ?")?;
         let value = stmt.query_row([file], |row| row.get::<_, Vec<u8>>(0))?;
-        let (file_graph, _): (serde::StackGraph, usize) =
-            bincode::decode_from_slice(&value, BINCODE_CONFIG)?;
+        let (file_graph, _): (crate::serde::StackGraph, usize) =
+            bincode::borrow_decode_from_slice(&value, BINCODE_CONFIG)?;
         file_graph.load_into(graph)?;
         Ok(graph.get_file(file).expect("loaded file to exist"))
     }
@@ -612,8 +612,8 @@ impl SQLiteReader {
                 &self.conn,
                 &mut self.stats,
             )?;
-            let (path, _): (serde::PartialPath, usize) =
-                bincode::decode_from_slice(&value, BINCODE_CONFIG)?;
+            let (path, _): (crate::serde::PartialPath, usize) =
+                bincode::borrow_decode_from_slice(&value, BINCODE_CONFIG)?;
             let path = path.to_partial_path(&mut self.graph, &mut self.partials)?;
             copious_debugging!(
                 "   > Loaded {}",
@@ -670,8 +670,8 @@ impl SQLiteReader {
                     &self.conn,
                     &mut self.stats,
                 )?;
-                let (path, _): (serde::PartialPath, usize) =
-                    bincode::decode_from_slice(&value, BINCODE_CONFIG)?;
+                let (path, _): (crate::serde::PartialPath, usize) =
+                    bincode::borrow_decode_from_slice(&value, BINCODE_CONFIG)?;
                 let path = path.to_partial_path(&mut self.graph, &mut self.partials)?;
                 copious_debugging!(
                     "   > Loaded {}",
