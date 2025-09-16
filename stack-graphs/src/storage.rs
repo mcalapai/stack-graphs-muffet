@@ -182,27 +182,6 @@ impl SQLiteWriter {
         })
     }
 
-    #[inline]
-    fn encode_into_buf<E: bincode::Encode>(
-        &mut self,
-        val: &E,
-    ) -> std::result::Result<&[u8], EncodeError> {
-        self.buf.clear();
-
-        // First pass: compute exact size to avoid growth reallocation.
-        let mut s = bincode::enc::write::SizeWriter::default();
-        bincode::encode_into_writer(val, &mut s, BINCODE_CONFIG)?;
-        let len = s.bytes_written;
-
-        // Ensure capacity and make a slice we can write into.
-        self.buf.resize(len, 0);
-        let mut w = bincode::enc::write::SliceWriter::new(self.buf.as_mut_slice());
-
-        // Second pass: encode directly into the pre-sized slice.
-        bincode::encode_into_writer(val, &mut w, BINCODE_CONFIG)?;
-        Ok(&self.buf[..len])
-    }
-
     /// Create database tables and write metadata.
     fn init(conn: &mut Connection) -> Result<()> {
         let tx = conn.transaction()?;
@@ -304,7 +283,7 @@ impl SQLiteWriter {
     /// Store an error, indicating that indexing this file failed.
     pub fn store_error_for_file(&mut self, file: &Path, tag: &str, error: &str) -> Result<()> {
         let tx = self.conn.transaction()?;
-        Self::store_error_for_file_inner(&tx, file, tag, error)?;
+        Self::store_error_for_file_inner(&tx, file, tag, error, &mut self.buf)?;
         tx.commit()?;
         Ok(())
     }
@@ -317,25 +296,24 @@ impl SQLiteWriter {
         file: &Path,
         tag: &str,
         error: &str,
+        buf: &mut Vec<u8>,
     ) -> Result<()> {
         copious_debugging!("--> Store error for {}", file.display());
         let mut stmt = conn
             .prepare_cached("INSERT INTO graphs (file, tag, error, value) VALUES (?, ?, ?, ?)")?;
         let graph = crate::serde::StackGraph::default();
 
-        // Encode using a reusable local buffer (two-pass: size then write)
-        let mut buf = Vec::<u8>::new();
-        let serialized = {
-            let mut s = bincode::enc::write::SizeWriter::default();
-            bincode::encode_into_writer(&graph, &mut s, BINCODE_CONFIG)?;
-            let len = s.bytes_written;
-            buf.resize(len, 0);
-            let mut w = bincode::enc::write::SliceWriter::new(buf.as_mut_slice());
-            bincode::encode_into_writer(&graph, &mut w, BINCODE_CONFIG)?;
-            &buf[..len]
-        };
+        // Encode into reusable buffer: size pass then write pass.
+        // Docs: encode_into_writer https://docs.rs/bincode/latest/bincode/
+        buf.clear();
+        let mut s = bincode::enc::write::SizeWriter::default();
+        bincode::encode_into_writer(&graph, &mut s, BINCODE_CONFIG)?;
+        let len = s.bytes_written;
+        buf.resize(len, 0);
+        let mut w = bincode::enc::write::SliceWriter::new(buf.as_mut_slice());
+        bincode::encode_into_writer(&graph, &mut w, BINCODE_CONFIG)?;
 
-        stmt.execute((&file.to_string_lossy(), tag, error, serialized))?;
+        stmt.execute((&file.to_string_lossy(), tag, error, &buf[..len]))?;
         Ok(())
     }
 
@@ -354,8 +332,8 @@ impl SQLiteWriter {
         let path = Path::new(graph[file].name());
         let tx = self.conn.transaction()?;
         Self::clean_file_inner(&tx, path)?;
-        Self::store_graph_for_file_inner(&tx, graph, file, tag)?;
-        Self::store_partial_paths_for_file_inner(&tx, graph, file, partials, paths)?;
+        Self::store_graph_for_file_inner(&tx, graph, file, tag, &mut self.buf)?;
+        Self::store_partial_paths_for_file_inner(&tx, graph, file, partials, paths, &mut self.buf)?;
         tx.commit()?;
         Ok(())
     }
@@ -368,6 +346,7 @@ impl SQLiteWriter {
         graph: &StackGraph,
         file: Handle<File>,
         tag: &str,
+        buf: &mut Vec<u8>,
     ) -> Result<()> {
         let file_str = graph[file].name();
         copious_debugging!("--> Store graph for {}", file_str);
@@ -375,20 +354,16 @@ impl SQLiteWriter {
             conn.prepare_cached("INSERT INTO graphs (file, tag, value) VALUES (?, ?, ?)")?;
         let graph = serde::StackGraph::from_graph_filter(graph, &FileFilter(file));
 
-        // Encode using reusable buffer
-        let mut buf = Vec::new();
-        let serialized = {
-            // local helper to reuse encode logic without changing the struct signature here
-            let mut s = bincode::enc::write::SizeWriter::default();
-            bincode::encode_into_writer(&graph, &mut s, BINCODE_CONFIG)?;
-            let len = s.bytes_written;
-            buf.resize(len, 0);
-            let mut w = bincode::enc::write::SliceWriter::new(buf.as_mut_slice());
-            bincode::encode_into_writer(&graph, &mut w, BINCODE_CONFIG)?;
-            &buf[..len]
-        };
+        // Encode into reusable buffer: size pass then write pass.
+        buf.clear();
+        let mut s = bincode::enc::write::SizeWriter::default();
+        bincode::encode_into_writer(&graph, &mut s, BINCODE_CONFIG)?;
+        let len = s.bytes_written;
+        buf.resize(len, 0);
+        let mut w = bincode::enc::write::SliceWriter::new(buf.as_mut_slice());
+        bincode::encode_into_writer(&graph, &mut w, BINCODE_CONFIG)?;
 
-        stmt.execute((file_str, tag, serialized))?;
+        stmt.execute((file_str, tag, &buf[..len]))?;
         Ok(())
     }
 
@@ -401,6 +376,7 @@ impl SQLiteWriter {
         file: Handle<File>,
         partials: &mut PartialPaths,
         paths: IP,
+        buf: &mut Vec<u8>,
     ) -> Result<()>
     where
         IP: IntoIterator<Item = &'a PartialPath>,
@@ -416,9 +392,6 @@ impl SQLiteWriter {
         #[cfg_attr(not(feature = "copious-debugging"), allow(unused))]
         let mut root_path_count = 0usize;
 
-        // Reusable buffer for per-path encodes
-        let mut buf = Vec::<u8>::new();
-
         for path in paths {
             copious_debugging!(
                 "--> Add {} partial path {}",
@@ -427,17 +400,17 @@ impl SQLiteWriter {
             );
             let start_node_id = graph[path.start_node].id();
 
-            // Prepare serializable view and encode into the reusable buffer
+            // Prepare the serializable view
             let path_ser = serde::PartialPath::from_partial_path(graph, partials, path);
-            let serialized = {
-                let mut s = bincode::enc::write::SizeWriter::default();
-                bincode::encode_into_writer(&path_ser, &mut s, BINCODE_CONFIG)?;
-                let len = s.bytes_written;
-                buf.resize(len, 0);
-                let mut w = bincode::enc::write::SliceWriter::new(buf.as_mut_slice());
-                bincode::encode_into_writer(&path_ser, &mut w, BINCODE_CONFIG)?;
-                &buf[..len]
-            };
+
+            // Encode into reusable buffer (two-pass, exact size)
+            buf.clear();
+            let mut s = bincode::enc::write::SizeWriter::default();
+            bincode::encode_into_writer(&path_ser, &mut s, BINCODE_CONFIG)?;
+            let len = s.bytes_written;
+            buf.resize(len, 0);
+            let mut w = bincode::enc::write::SliceWriter::new(buf.as_mut_slice());
+            bincode::encode_into_writer(&path_ser, &mut w, BINCODE_CONFIG)?;
 
             if start_node_id.is_root() {
                 copious_debugging!(
@@ -445,15 +418,15 @@ impl SQLiteWriter {
                     path.symbol_stack_precondition.display(graph, partials),
                 );
                 let symbol_stack = path.symbol_stack_precondition.storage_key(graph, partials);
-                root_stmt.execute((file_str, symbol_stack, serialized))?;
+                root_stmt.execute((file_str, symbol_stack, &buf[..len]))?;
                 root_path_count += 1;
             } else if start_node_id.is_in_file(file) {
                 copious_debugging!(
                     " * Add as node path from node {}",
                     path.start_node.display(graph),
                 );
-                // FIX: Handle<Node> has no `local_id` field — use the computed NodeID.
-                node_stmt.execute((file_str, start_node_id.local_id(), serialized))?;
+                // Use NodeID’s local_id() accessor; Handle<Node> has no `local_id` field.
+                node_stmt.execute((file_str, start_node_id.local_id(), &buf[..len]))?;
                 node_path_count += 1;
             } else {
                 panic!(
@@ -462,6 +435,7 @@ impl SQLiteWriter {
                     graph[file].name()
                 );
             }
+
             copious_debugging!(
                 " * Added {} node paths and {} root paths",
                 node_path_count,
