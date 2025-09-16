@@ -9,7 +9,7 @@ use bincode::error::DecodeError;
 use bincode::error::EncodeError;
 use itertools::Itertools;
 use rusqlite::functions::FunctionFlags;
-use rusqlite::types::ValueRef;
+use rusqlite::types::{Type, ValueRef};
 use rusqlite::Connection;
 use rusqlite::OptionalExtension;
 use rusqlite::Params;
@@ -148,7 +148,7 @@ impl<'a, P: Params + Clone> Files<'a, P> {
 /// Writer to store stack graphs and partial paths in a SQLite database.
 pub struct SQLiteWriter {
     conn: Connection,
-    // Reusable encode buffer to avoid per-call Vec allocation (DHAT PP 1.7)
+    /// Reusable encode buffer to avoid per-call Vec allocation (DHAT PP 1.7)
     buf: Vec<u8>,
 }
 
@@ -302,18 +302,8 @@ impl SQLiteWriter {
         let mut stmt = conn
             .prepare_cached("INSERT INTO graphs (file, tag, error, value) VALUES (?, ?, ?, ?)")?;
         let graph = crate::serde::StackGraph::default();
-
-        // Encode into reusable buffer: size pass then write pass.
-        // Docs: encode_into_writer https://docs.rs/bincode/latest/bincode/
-        buf.clear();
-        let mut s = bincode::enc::write::SizeWriter::default();
-        bincode::encode_into_writer(&graph, &mut s, BINCODE_CONFIG)?;
-        let len = s.bytes_written;
-        buf.resize(len, 0);
-        let mut w = bincode::enc::write::SliceWriter::new(buf.as_mut_slice());
-        bincode::encode_into_writer(&graph, &mut w, BINCODE_CONFIG)?;
-
-        stmt.execute((&file.to_string_lossy(), tag, error, &buf[..len]))?;
+        let serialized = encode_into_buf(&graph, buf)?;
+        stmt.execute((&file.to_string_lossy(), tag, error, serialized))?;
         Ok(())
     }
 
@@ -353,17 +343,8 @@ impl SQLiteWriter {
         let mut stmt =
             conn.prepare_cached("INSERT INTO graphs (file, tag, value) VALUES (?, ?, ?)")?;
         let graph = serde::StackGraph::from_graph_filter(graph, &FileFilter(file));
-
-        // Encode into reusable buffer: size pass then write pass.
-        buf.clear();
-        let mut s = bincode::enc::write::SizeWriter::default();
-        bincode::encode_into_writer(&graph, &mut s, BINCODE_CONFIG)?;
-        let len = s.bytes_written;
-        buf.resize(len, 0);
-        let mut w = bincode::enc::write::SliceWriter::new(buf.as_mut_slice());
-        bincode::encode_into_writer(&graph, &mut w, BINCODE_CONFIG)?;
-
-        stmt.execute((file_str, tag, &buf[..len]))?;
+        let serialized = encode_into_buf(&graph, buf)?;
+        stmt.execute((file_str, tag, serialized))?;
         Ok(())
     }
 
@@ -391,42 +372,31 @@ impl SQLiteWriter {
         let mut node_path_count = 0usize;
         #[cfg_attr(not(feature = "copious-debugging"), allow(unused))]
         let mut root_path_count = 0usize;
-
         for path in paths {
             copious_debugging!(
                 "--> Add {} partial path {}",
                 file_str,
                 path.display(graph, partials)
             );
-            let start_node_id = graph[path.start_node].id();
+            let start_node = graph[path.start_node].id();
 
-            // Prepare the serializable view
             let path_ser = serde::PartialPath::from_partial_path(graph, partials, path);
+            let serialized = encode_into_buf(&path_ser, buf)?;
 
-            // Encode into reusable buffer (two-pass, exact size)
-            buf.clear();
-            let mut s = bincode::enc::write::SizeWriter::default();
-            bincode::encode_into_writer(&path_ser, &mut s, BINCODE_CONFIG)?;
-            let len = s.bytes_written;
-            buf.resize(len, 0);
-            let mut w = bincode::enc::write::SliceWriter::new(buf.as_mut_slice());
-            bincode::encode_into_writer(&path_ser, &mut w, BINCODE_CONFIG)?;
-
-            if start_node_id.is_root() {
+            if start_node.is_root() {
                 copious_debugging!(
                     " * Add as root path with symbol stack {}",
                     path.symbol_stack_precondition.display(graph, partials),
                 );
                 let symbol_stack = path.symbol_stack_precondition.storage_key(graph, partials);
-                root_stmt.execute((file_str, symbol_stack, &buf[..len]))?;
+                root_stmt.execute((file_str, symbol_stack, serialized))?;
                 root_path_count += 1;
-            } else if start_node_id.is_in_file(file) {
+            } else if start_node.is_in_file(file) {
                 copious_debugging!(
                     " * Add as node path from node {}",
                     path.start_node.display(graph),
                 );
-                // Use NodeID’s local_id() accessor; Handle<Node> has no `local_id` field.
-                node_stmt.execute((file_str, start_node_id.local_id(), &buf[..len]))?;
+                node_stmt.execute((file_str, start_node.local_id(), serialized))?;
                 node_path_count += 1;
             } else {
                 panic!(
@@ -435,7 +405,6 @@ impl SQLiteWriter {
                     graph[file].name()
                 );
             }
-
             copious_debugging!(
                 " * Added {} node paths and {} root paths",
                 node_path_count,
@@ -592,12 +561,20 @@ impl SQLiteReader {
         copious_debugging!(" * Load from database");
         stats.file_loads += 1;
 
-        // Keep it simple and robust: fetch owned Vec<u8> and borrow-decode from it.
         let mut stmt = conn.prepare_cached("SELECT value FROM graphs WHERE file = ?")?;
-        let value = stmt.query_row([file], |row| row.get::<_, Vec<u8>>(0))?;
-        let (file_graph, _): (crate::serde::StackGraph, usize) =
-            bincode::borrow_decode_from_slice(&value, BINCODE_CONFIG)?;
-        file_graph.load_into(graph)?;
+        let mut rows = stmt.query([file])?;
+        if let Some(row) = rows.next()? {
+            // Borrow the BLOB directly; decode and fully consume while the row is alive.
+            let slice = row.get_ref(0)?.as_blob().map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(0, Type::Blob, Box::new(e))
+            })?;
+            let (file_graph, _): (crate::serde::StackGraph, usize) =
+                bincode::borrow_decode_from_slice(slice, BINCODE_CONFIG)?;
+            file_graph.load_into(graph)?;
+        } else {
+            return Err(rusqlite::Error::QueryReturnedNoRows.into());
+        }
+
         Ok(graph.get_file(file).expect("loaded file to exist"))
     }
 
@@ -620,7 +597,7 @@ impl SQLiteReader {
         Ok(())
     }
 
-    /// Ensure the paths starting a the given node are loaded.
+    /// Ensure the paths starting at the given node are loaded.
     fn load_paths_for_node(
         &mut self,
         node: Handle<Node>,
@@ -633,24 +610,24 @@ impl SQLiteReader {
             return Ok(());
         }
         self.stats.node_path_loads += 1;
-
         let id = self.graph[node].id();
         let file = id.file().expect("file node required");
         let file = self.graph[file].name();
 
-        // Fetch owned Vec<u8> for each path row; decode from that slice.
         let mut stmt = self
             .conn
             .prepare_cached("SELECT value FROM file_paths WHERE file = ? AND local_id = ?")?;
-        let rows = stmt.query_map((file, id.local_id()), |row| row.get::<_, Vec<u8>>(0))?;
+        let mut rows = stmt.query((file, id.local_id()))?;
 
         #[cfg_attr(not(feature = "copious-debugging"), allow(unused))]
         let mut count = 0usize;
-        for row in rows {
+        while let Some(row) = rows.next()? {
             cancellation_flag.check("loading node paths")?;
-            let value = row?;
+            let slice = row.get_ref(0)?.as_blob().map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(0, Type::Blob, Box::new(e))
+            })?;
             let (path_ser, _): (crate::serde::PartialPath, usize) =
-                bincode::borrow_decode_from_slice(&value, BINCODE_CONFIG)?;
+                bincode::borrow_decode_from_slice(slice, BINCODE_CONFIG)?;
             let path = path_ser.to_partial_path(&mut self.graph, &mut self.partials)?;
             copious_debugging!(
                 "   > Loaded {}",
@@ -675,11 +652,10 @@ impl SQLiteReader {
             symbol_stack.display(&self.graph, &mut self.partials)
         );
         let mut stmt = self.conn.prepare_cached(
-            "SELECT file,value from root_paths WHERE symbol_stack LIKE ? ESCAPE ?",
+            "SELECT file,value FROM root_paths WHERE symbol_stack LIKE ? ESCAPE ?",
         )?;
         let (symbol_stack_patterns, escape) =
             symbol_stack.storage_key_patterns(&self.graph, &mut self.partials);
-
         for symbol_stack in symbol_stack_patterns {
             copious_debugging!(
                 " * Load extensions from root with prefix symbol stack {}",
@@ -692,19 +668,13 @@ impl SQLiteReader {
             }
             self.stats.root_path_loads += 1;
 
-            let rows = stmt.query_map([symbol_stack, escape.clone()], |row| {
-                let file: String = row.get(0)?;
-                let value: Vec<u8> = row.get(1)?;
-                Ok((file, value))
-            })?;
-
+            let mut rows = stmt.query([symbol_stack, escape.clone()])?;
             #[cfg_attr(not(feature = "copious-debugging"), allow(unused))]
             let mut count = 0usize;
-            for row in rows {
+            while let Some(row) = rows.next()? {
                 cancellation_flag.check("loading root paths")?;
-                let (file, value) = row?;
-
-                // Ensure graph for 'file' is available once
+                let file: String = row.get(0)?;
+                // Ensure graph for 'file' is present
                 Self::load_graph_for_file_inner(
                     &file,
                     &mut self.graph,
@@ -713,8 +683,11 @@ impl SQLiteReader {
                     &mut self.stats,
                 )?;
 
+                let slice = row.get_ref(1)?.as_blob().map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(1, Type::Blob, Box::new(e))
+                })?;
                 let (path_ser, _): (crate::serde::PartialPath, usize) =
-                    bincode::borrow_decode_from_slice(&value, BINCODE_CONFIG)?;
+                    bincode::borrow_decode_from_slice(slice, BINCODE_CONFIG)?;
                 let path = path_ser.to_partial_path(&mut self.graph, &mut self.partials)?;
                 copious_debugging!(
                     "   > Loaded {}",
@@ -905,11 +878,29 @@ fn status_for_file<T: AsRef<str>>(
             .optional()?
             .unwrap_or(FileStatus::Missing)
     } else {
-        // FIX: the column is 'error', not 'status'
+        // FIX: column is `error`, not `status`
         let mut stmt = conn.prepare_cached("SELECT error FROM graphs WHERE file = ?")?;
         stmt.query_row([file], |r| r.get_ref(0).map(FileStatus::from))
             .optional()?
             .unwrap_or(FileStatus::Missing)
     };
     Ok(result)
+}
+
+/// Encode `value` into `buf` using bincode's writer API in two passes (size, then write),
+/// reusing the same allocation across calls.
+fn encode_into_buf<'a, E: bincode::Encode>(
+    value: &E,
+    buf: &'a mut Vec<u8>,
+) -> std::result::Result<&'a [u8], EncodeError> {
+    buf.clear();
+    // 1) Measure exact size
+    let mut s = bincode::enc::write::SizeWriter::default();
+    bincode::encode_into_writer(value, &mut s, BINCODE_CONFIG)?;
+    let len = s.bytes_written;
+    // 2) Resize once and write directly into the slice
+    buf.resize(len, 0);
+    let mut w = bincode::enc::write::SliceWriter::new(buf.as_mut_slice());
+    bincode::encode_into_writer(value, &mut w, BINCODE_CONFIG)?;
+    Ok(&buf[..len])
 }
