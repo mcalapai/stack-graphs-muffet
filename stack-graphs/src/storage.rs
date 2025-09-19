@@ -28,6 +28,7 @@ use crate::graph::File;
 use crate::graph::Node;
 use crate::graph::NodeID;
 use crate::graph::StackGraph;
+use crate::graph::Symbol;
 use crate::partial::PartialPath;
 use crate::partial::PartialPaths;
 use crate::partial::PartialSymbolStack;
@@ -37,6 +38,8 @@ use crate::stitching::Database;
 use crate::stitching::ForwardCandidates;
 use crate::CancellationError;
 use crate::CancellationFlag;
+
+use smallvec::SmallVec;
 
 use self::encoding::{decode_partial_path, encode_partial_path};
 
@@ -450,7 +453,7 @@ pub struct SQLiteReader {
     conn: Connection,
     loaded_graphs: HashSet<Handle<File>>,
     loaded_node_paths: HashSet<Handle<Node>>,
-    loaded_root_paths: HashSet<SymbolStackQuery>,
+    loaded_root_paths: HashSet<SymbolStackQueryKey>,
     node_paths_prefetched: HashSet<Handle<File>>,
     root_paths_prefetched: HashSet<Handle<File>>,
     graph: StackGraph,
@@ -690,7 +693,7 @@ impl SQLiteReader {
         let mut count = 0usize;
         while let Some(row) = rows.next()? {
             cancellation_flag.check("loading root paths")?;
-            let symbol_stack: String = row.get(0)?;
+            let _symbol_stack: String = row.get(0)?;
             let slice = row.get_ref(1)?.as_blob().map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(1, Type::Blob, Box::new(e))
             })?;
@@ -699,11 +702,15 @@ impl SQLiteReader {
                 "   > Prefetched root {}",
                 path.display(&self.graph, &mut self.partials)
             );
+            let symbol_stack_precondition = path.symbol_stack_precondition;
             self.db
                 .add_partial_path(&self.graph, &mut self.partials, path);
 
-            self.loaded_root_paths
-                .insert(SymbolStackQuery::Exact(symbol_stack.clone()));
+            let cache_key = SymbolStackQueryKey::from_exact_stack(
+                &mut self.partials,
+                symbol_stack_precondition,
+            );
+            self.loaded_root_paths.insert(cache_key);
             count += 1;
         }
         copious_debugging!("   > Prefetched {count} root paths for {file}");
@@ -764,8 +771,8 @@ impl SQLiteReader {
             symbol_stack.display(&self.graph, &mut self.partials)
         );
         let queries = symbol_stack.storage_key_queries(&self.graph, &mut self.partials);
-        for query in queries {
-            if !self.loaded_root_paths.insert(query.clone()) {
+        for (cache_key, query) in queries {
+            if !self.loaded_root_paths.insert(cache_key.clone()) {
                 copious_debugging!("   > Already loaded");
                 self.stats.root_path_cached += 1;
                 continue;
@@ -862,6 +869,50 @@ impl SQLiteReader {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum SymbolStackExactVariant {
+    /// Matches a `V`-prefixed storage key for an exact symbol stack prefix.
+    VariablePrefix,
+    /// Matches an `X`-prefixed storage key for a full stack without variables.
+    FullStack,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum SymbolStackRangeVariant {
+    /// Matches a `V`-prefixed range query (variable-aware prefix).
+    VariablePrefix,
+    /// Matches an `X`-prefixed range query (non-variable prefix).
+    NonVariablePrefix,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum SymbolStackQueryKey {
+    Exact {
+        variant: SymbolStackExactVariant,
+        symbols: SmallVec<[Handle<Symbol>; 8]>,
+    },
+    Range {
+        variant: SymbolStackRangeVariant,
+        symbols: SmallVec<[Handle<Symbol>; 8]>,
+    },
+}
+
+impl SymbolStackQueryKey {
+    fn from_exact_stack(
+        partials: &mut PartialPaths,
+        stack: PartialSymbolStack,
+    ) -> SymbolStackQueryKey {
+        let symbols = stack
+            .iter(partials)
+            .map(|scoped| scoped.symbol)
+            .collect::<SmallVec<[Handle<Symbol>; 8]>>();
+        SymbolStackQueryKey::Exact {
+            variant: SymbolStackExactVariant::FullStack,
+            symbols,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum SymbolStackQuery {
     Exact(String),
@@ -910,37 +961,63 @@ impl PartialSymbolStack {
         mut self,
         graph: &StackGraph,
         partials: &mut PartialPaths,
-    ) -> Vec<SymbolStackQuery> {
+    ) -> Vec<(SymbolStackQueryKey, SymbolStackQuery)> {
         let has_variable = self.has_variable();
         let mut queries = Vec::new();
         let mut symbols = String::new();
+        let mut symbol_handles: SmallVec<[Handle<Symbol>; 8]> = SmallVec::new();
         while let Some(symbol) = self.pop_front(partials) {
             if !symbols.is_empty() {
                 symbols.push('\u{241F}');
             }
             symbols.push_str(&graph[symbol.symbol]);
+            symbol_handles.push(symbol.symbol);
             let mut key = String::from("V\u{241E}");
             key.push_str(&symbols);
-            queries.push(SymbolStackQuery::Exact(key));
+            queries.push((
+                SymbolStackQueryKey::Exact {
+                    variant: SymbolStackExactVariant::VariablePrefix,
+                    symbols: symbol_handles.clone(),
+                },
+                SymbolStackQuery::Exact(key),
+            ));
         }
 
         // Pattern for paths matching exactly this stack without variables.
         let mut exact_key = String::from("X\u{241E}");
         exact_key.push_str(&symbols);
-        queries.push(SymbolStackQuery::Exact(exact_key));
+        queries.push((
+            SymbolStackQueryKey::Exact {
+                variant: SymbolStackExactVariant::FullStack,
+                symbols: symbol_handles.clone(),
+            },
+            SymbolStackQuery::Exact(exact_key),
+        ));
 
         if has_variable {
             let mut prefix = String::from("V\u{241E}");
             prefix.push_str(&symbols);
             prefix.push('\u{241F}');
             let end = prefix_upper_bound(&prefix);
-            queries.push(SymbolStackQuery::Range { start: prefix, end });
+            queries.push((
+                SymbolStackQueryKey::Range {
+                    variant: SymbolStackRangeVariant::VariablePrefix,
+                    symbols: symbol_handles.clone(),
+                },
+                SymbolStackQuery::Range { start: prefix, end },
+            ));
 
             let mut prefix = String::from("X\u{241E}");
             prefix.push_str(&symbols);
             prefix.push('\u{241F}');
             let end = prefix_upper_bound(&prefix);
-            queries.push(SymbolStackQuery::Range { start: prefix, end });
+            queries.push((
+                SymbolStackQueryKey::Range {
+                    variant: SymbolStackRangeVariant::NonVariablePrefix,
+                    symbols: symbol_handles,
+                },
+                SymbolStackQuery::Range { start: prefix, end },
+            ));
         }
 
         queries
