@@ -974,14 +974,14 @@ impl<'a> StorageFileListing<'a> for RedbFileListing<'a> {
     }
 }
 
-struct GraphRecord {
+pub(crate) struct GraphRecord {
     tag: String,
     error: Option<String>,
     graph_blob: Vec<u8>,
 }
 
 impl GraphRecord {
-    fn decode(data: &[u8]) -> Result<Self> {
+    pub(crate) fn decode(data: &[u8]) -> Result<Self> {
         let mut slice = data;
         let tag_len = read_u32(&mut slice)? as usize;
         let tag = read_string(&mut slice, tag_len)?;
@@ -1004,7 +1004,7 @@ impl GraphRecord {
         })
     }
 
-    fn encode(tag: &str, error: Option<&str>, graph_blob: &[u8]) -> Vec<u8> {
+    pub(crate) fn encode(tag: &str, error: Option<&str>, graph_blob: &[u8]) -> Vec<u8> {
         let mut buf = Vec::with_capacity(
             4 + tag.len() + 1 + error.map(|e| 4 + e.len()).unwrap_or(0) + 4 + graph_blob.len(),
         );

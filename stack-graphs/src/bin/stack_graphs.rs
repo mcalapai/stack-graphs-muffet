@@ -3,7 +3,11 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+#[cfg(feature = "storage-redb")]
+use redb::{
+    Database, MultimapTableDefinition, ReadableMultimapTable, ReadableTable, TableDefinition,
+};
 use serde::Deserialize;
 use stack_graphs::graph::StackGraph;
 use stack_graphs::partial::{PartialPath, PartialPaths};
@@ -30,6 +34,8 @@ fn run() -> Result<()> {
         Commands::Index(args) => handle_index(args),
         #[cfg(feature = "storage-redb")]
         Commands::Convert(args) => handle_convert(args),
+        #[cfg(feature = "storage-redb")]
+        Commands::InspectRedb(args) => handle_inspect(args),
     }
 }
 
@@ -48,6 +54,9 @@ enum Commands {
     /// Convert an existing SQLite database into redb format
     #[cfg(feature = "storage-redb")]
     Convert(ConvertArgs),
+    /// Inspect a redb database and display table summaries
+    #[cfg(feature = "storage-redb")]
+    InspectRedb(InspectArgs),
 }
 
 #[derive(Parser)]
@@ -78,6 +87,26 @@ struct ConvertArgs {
     /// Overwrite the destination file if it already exists
     #[arg(long)]
     overwrite: bool,
+}
+
+#[cfg(feature = "storage-redb")]
+#[derive(Parser)]
+struct InspectArgs {
+    /// Path to the redb database to inspect
+    #[arg(long)]
+    database: PathBuf,
+    /// Table to dump; defaults to graphs summary
+    #[arg(long, value_enum, default_value = "graphs")]
+    table: InspectTable,
+}
+
+#[cfg(feature = "storage-redb")]
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum InspectTable {
+    Graphs,
+    FilePaths,
+    RootPathsByFile,
+    RootPathsBySymbol,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -152,6 +181,81 @@ fn handle_convert(args: ConvertArgs) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "storage-redb")]
+fn handle_inspect(args: InspectArgs) -> Result<()> {
+    const GRAPHS: TableDefinition<&str, &[u8]> = TableDefinition::new("graphs");
+    const FILE_PATHS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("file_paths");
+    const ROOT_PATHS_BY_FILE: TableDefinition<&[u8], &[u8]> =
+        TableDefinition::new("root_paths_by_file");
+    const ROOT_PATHS_BY_SYMBOL: MultimapTableDefinition<&str, &str> =
+        MultimapTableDefinition::new("root_paths_by_symbol");
+
+    let db = Database::open(&args.database)
+        .with_context(|| format!("failed to open {}", args.database.display()))?;
+    let txn = db.begin_read()?;
+
+    match args.table {
+        InspectTable::Graphs => {
+            let table = txn.open_table(GRAPHS)?;
+            let mut iter = table.iter()?;
+            println!("file\ttag\tstatus");
+            while let Some(entry) = iter.next() {
+                let (key, value) = entry?;
+                let (tag, error) = decode_graph_record_summary(value.value())?;
+                let status = error.as_deref().unwrap_or("indexed");
+                println!("{}\t{}\t{}", key.value(), tag, status);
+            }
+        }
+        InspectTable::FilePaths => {
+            let table = txn.open_table(FILE_PATHS)?;
+            let mut counts: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            let mut iter = table.iter()?;
+            while let Some(entry) = iter.next() {
+                let (key, _) = entry?;
+                let (file, _) = parse_node_key(key.value())?;
+                *counts.entry(file).or_default() += 1;
+            }
+            println!("file\tnode_paths");
+            for (file, count) in counts {
+                println!("{}\t{}", file, count);
+            }
+        }
+        InspectTable::RootPathsByFile => {
+            let table = txn.open_table(ROOT_PATHS_BY_FILE)?;
+            let mut counts: std::collections::BTreeMap<(String, String), usize> =
+                std::collections::BTreeMap::new();
+            let mut iter = table.iter()?;
+            while let Some(entry) = iter.next() {
+                let (key, _) = entry?;
+                let (file, symbol) = parse_root_file_key(key.value())?;
+                *counts.entry((file, symbol)).or_default() += 1;
+            }
+            println!("file\tsymbol\troot_paths");
+            for ((file, symbol), count) in counts {
+                println!("{}\t{}\t{}", file, symbol, count);
+            }
+        }
+        InspectTable::RootPathsBySymbol => {
+            let table = txn.open_multimap_table(ROOT_PATHS_BY_SYMBOL)?;
+            let mut iter = table.iter()?;
+            println!("symbol\tfiles");
+            while let Some(entry) = iter.next() {
+                let (symbol, mut values) = entry?;
+                let mut files = Vec::new();
+                while let Some(value) = values.next() {
+                    files.push(value?.value().to_string());
+                }
+                files.sort();
+                files.dedup();
+                println!("{}\t{}", symbol.value(), files.join(", "));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn index_with_backend<W>(database: &Path, manifest: &Manifest, clean: bool) -> Result<()>
 where
     W: StorageWriter,
@@ -219,6 +323,81 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(feature = "storage-redb")]
+fn parse_node_key(data: &[u8]) -> Result<(String, u32)> {
+    let split = data
+        .iter()
+        .position(|b| *b == 0)
+        .ok_or_else(|| anyhow::anyhow!("invalid node key"))?;
+    let file = std::str::from_utf8(&data[..split])?.to_string();
+    if data.len() < split + 5 {
+        bail!("node key truncated");
+    }
+    let id = u32::from_be_bytes([
+        data[split + 1],
+        data[split + 2],
+        data[split + 3],
+        data[split + 4],
+    ]);
+    Ok((file, id))
+}
+
+#[cfg(feature = "storage-redb")]
+fn parse_root_file_key(data: &[u8]) -> Result<(String, String)> {
+    let split = data
+        .iter()
+        .position(|b| *b == 0)
+        .ok_or_else(|| anyhow::anyhow!("invalid root key"))?;
+    let file = std::str::from_utf8(&data[..split])?.to_string();
+    let symbol = std::str::from_utf8(&data[split + 1..])?.to_string();
+    Ok((file, symbol))
+}
+
+#[cfg(feature = "storage-redb")]
+fn decode_graph_record_summary(data: &[u8]) -> Result<(String, Option<String>)> {
+    let mut slice = data;
+    let tag_len = read_u32(&mut slice)? as usize;
+    let tag = read_string(&mut slice, tag_len)?;
+    let has_error = read_u8(&mut slice)? != 0;
+    let error = if has_error {
+        let len = read_u32(&mut slice)? as usize;
+        Some(read_string(&mut slice, len)?)
+    } else {
+        None
+    };
+    Ok((tag, error))
+}
+
+#[cfg(feature = "storage-redb")]
+fn read_u32(slice: &mut &[u8]) -> Result<u32> {
+    if slice.len() < 4 {
+        bail!("unexpected end of record");
+    }
+    let value = u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]);
+    *slice = &slice[4..];
+    Ok(value)
+}
+
+#[cfg(feature = "storage-redb")]
+fn read_u8(slice: &mut &[u8]) -> Result<u8> {
+    if slice.is_empty() {
+        bail!("unexpected end of record");
+    }
+    let value = slice[0];
+    *slice = &slice[1..];
+    Ok(value)
+}
+
+#[cfg(feature = "storage-redb")]
+fn read_string(slice: &mut &[u8], len: usize) -> Result<String> {
+    if slice.len() < len {
+        bail!("unexpected end of record");
+    }
+    let value = std::str::from_utf8(&slice[..len])?.to_string();
+    *slice = &slice[len..];
+    Ok(value)
 }
 
 #[derive(Debug, Deserialize)]
