@@ -5,9 +5,16 @@
 // Please see the LICENSE-APACHE or LICENSE-MIT files in this distribution for license details.
 // ------------------------------------------------------------------------------------------------
 
+#[cfg(feature = "storage-redb")]
+pub mod compare;
 mod encoding;
 #[cfg(feature = "storage-redb")]
 pub mod redb;
+#[cfg(feature = "storage-redb")]
+pub use compare::{
+    compare_backends, ComparisonError, ComparisonReport, GraphEntry, GraphMismatch, NodePathEntry,
+    NodePathMismatch, RootPathEntry, RootPathMismatch, TableDiff,
+};
 #[cfg(feature = "storage-redb")]
 pub use redb::{RedbError, RedbReader, RedbWriter};
 
@@ -27,6 +34,8 @@ use std::fmt;
 use std::path::Path;
 use std::path::PathBuf;
 use thiserror::Error;
+
+use sha2::{Digest, Sha256};
 
 use crate::arena::Handle;
 use crate::graph::Degree;
@@ -803,15 +812,25 @@ impl SQLiteReader {
         copious_debugging!(" * Load from database");
         stats.file_loads += 1;
 
-        let mut stmt = conn.prepare_cached("SELECT value FROM graphs WHERE file = ?")?;
+        let mut stmt = conn.prepare_cached("SELECT tag, value FROM graphs WHERE file = ?")?;
         let mut rows = stmt.query([file])?;
         if let Some(row) = rows.next()? {
+            let tag: String = row.get(0)?;
             // Borrow the BLOB directly; decode and fully consume while the row is alive.
-            let slice = row.get_ref(0)?.as_blob().map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(0, Type::Blob, Box::new(e))
+            let slice = row.get_ref(1)?.as_blob().map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(1, Type::Blob, Box::new(e))
             })?;
             let (file_graph, _): (crate::serde::StackGraph, usize) =
                 bincode::borrow_decode_from_slice(slice, BINCODE_CONFIG)?;
+            let canonical_bytes = if stats.should_record_graph_sample() {
+                Some(
+                    bincode::encode_to_vec(&file_graph, BINCODE_CONFIG)
+                        .map_err(StorageError::from)?,
+                )
+            } else {
+                None
+            };
+            stats.record_graph_blob(file, Some(&tag), slice, canonical_bytes);
             file_graph.load_into(graph)?;
         } else {
             return Err(rusqlite::Error::QueryReturnedNoRows.into());
@@ -865,6 +884,15 @@ impl SQLiteReader {
                 rusqlite::Error::FromSqlConversionFailure(1, Type::Blob, Box::new(e))
             })?;
             let path = decode_partial_path(slice, &mut self.graph, &mut self.partials)?;
+            let canonical_bytes = if self.stats.should_record_node_sample() {
+                let mut buf = Vec::new();
+                encode_partial_path(&self.graph, &mut self.partials, &path, &mut buf)?;
+                Some(buf)
+            } else {
+                None
+            };
+            self.stats
+                .record_node_path_blob(&file_name, local_id, slice, canonical_bytes);
             copious_debugging!(
                 "   > Prefetched {}",
                 path.display(&self.graph, &mut self.partials)
@@ -912,11 +940,24 @@ impl SQLiteReader {
         let mut count = 0usize;
         while let Some(row) = rows.next()? {
             cancellation_flag.check("loading root paths")?;
-            let _symbol_stack: String = row.get(0)?;
+            let symbol_stack: String = row.get(0)?;
             let slice = row.get_ref(1)?.as_blob().map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(1, Type::Blob, Box::new(e))
             })?;
             let path = decode_partial_path(slice, &mut self.graph, &mut self.partials)?;
+            let canonical_bytes = if self.stats.should_record_root_sample() {
+                let mut buf = Vec::new();
+                encode_partial_path(&self.graph, &mut self.partials, &path, &mut buf)?;
+                Some(buf)
+            } else {
+                None
+            };
+            self.stats.record_root_path_blob(
+                file,
+                Some(symbol_stack.as_str()),
+                slice,
+                canonical_bytes,
+            );
             copious_debugging!(
                 "   > Prefetched root {}",
                 path.display(&self.graph, &mut self.partials)
@@ -1432,6 +1473,32 @@ where
     }
 }
 
+const GRAPH_SAMPLE_LIMIT: usize = 32;
+const PATH_SAMPLE_LIMIT: usize = 64;
+const ROOT_QUERY_SAMPLE_LIMIT: usize = 64;
+
+#[derive(Clone, Debug, Default)]
+pub struct GraphSample {
+    pub file: String,
+    pub tag: String,
+    pub stored_digest: String,
+    pub stored_bytes: usize,
+    pub normalized_digest: Option<String>,
+    pub normalized_bytes: Option<usize>,
+    pub digests_match: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PathSample {
+    pub file: String,
+    pub key: String,
+    pub stored_digest: String,
+    pub stored_bytes: usize,
+    pub normalized_digest: Option<String>,
+    pub normalized_bytes: Option<usize>,
+    pub digests_match: Option<bool>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Stats {
     pub file_loads: usize,
@@ -1443,6 +1510,15 @@ pub struct Stats {
     pub root_path_load_samples: Vec<String>,
     pub node_path_loads: usize,
     pub node_path_cached: usize,
+    pub graph_records_loaded: usize,
+    pub graph_bytes_loaded: usize,
+    pub graph_samples: Vec<GraphSample>,
+    pub node_path_records_loaded: usize,
+    pub node_path_bytes_loaded: usize,
+    pub node_path_samples: Vec<PathSample>,
+    pub root_path_records_loaded: usize,
+    pub root_path_bytes_loaded: usize,
+    pub root_path_samples: Vec<PathSample>,
 }
 
 impl Stats {
@@ -1451,11 +1527,19 @@ impl Stats {
     }
 
     fn clear_paths(&mut self) {
+        let file_loads = self.file_loads;
+        let file_cached = self.file_cached;
+        let graph_records_loaded = self.graph_records_loaded;
+        let graph_bytes_loaded = self.graph_bytes_loaded;
+        let graph_samples = self.graph_samples.clone();
         *self = Stats {
-            file_loads: self.file_loads,
-            file_cached: self.file_cached,
+            file_loads,
+            file_cached,
+            graph_records_loaded,
+            graph_bytes_loaded,
+            graph_samples,
             ..Stats::default()
-        }
+        };
     }
 
     fn record_root_path_load(&mut self, query: &SymbolStackQuery) {
@@ -1463,11 +1547,133 @@ impl Stats {
             SymbolStackQuery::Exact(_) => self.root_path_loads_exact += 1,
             SymbolStackQuery::Range { .. } => self.root_path_loads_range += 1,
         }
-        const SAMPLE_LIMIT: usize = 64;
-        if self.root_path_load_samples.len() < SAMPLE_LIMIT {
+        if self.root_path_load_samples.len() < ROOT_QUERY_SAMPLE_LIMIT {
             self.root_path_load_samples.push(query.to_string());
         }
     }
+
+    pub(crate) fn should_record_graph_sample(&self) -> bool {
+        self.graph_samples.len() < GRAPH_SAMPLE_LIMIT
+    }
+
+    pub(crate) fn should_record_node_sample(&self) -> bool {
+        self.node_path_samples.len() < PATH_SAMPLE_LIMIT
+    }
+
+    pub(crate) fn should_record_root_sample(&self) -> bool {
+        self.root_path_samples.len() < PATH_SAMPLE_LIMIT
+    }
+
+    pub(crate) fn record_graph_blob(
+        &mut self,
+        file: &str,
+        tag: Option<&str>,
+        stored_blob: &[u8],
+        canonical_blob: Option<Vec<u8>>,
+    ) {
+        self.graph_records_loaded += 1;
+        self.graph_bytes_loaded += stored_blob.len();
+        if self.graph_samples.len() >= GRAPH_SAMPLE_LIMIT {
+            return;
+        }
+        let stored_digest = digest_hex(stored_blob);
+        let (normalized_digest, normalized_bytes, digests_match) =
+            if let Some(bytes) = canonical_blob {
+                let digest = digest_hex(&bytes);
+                let len = bytes.len();
+                let matches = digest == stored_digest;
+                (Some(digest), Some(len), Some(matches))
+            } else {
+                (None, None, None)
+            };
+        self.graph_samples.push(GraphSample {
+            file: file.to_string(),
+            tag: tag.unwrap_or_default().to_string(),
+            stored_digest,
+            stored_bytes: stored_blob.len(),
+            normalized_digest,
+            normalized_bytes,
+            digests_match,
+        });
+    }
+
+    pub(crate) fn record_node_path_blob(
+        &mut self,
+        file: &str,
+        local_id: u32,
+        stored_blob: &[u8],
+        canonical_blob: Option<Vec<u8>>,
+    ) {
+        self.node_path_records_loaded += 1;
+        self.node_path_bytes_loaded += stored_blob.len();
+        if self.node_path_samples.len() >= PATH_SAMPLE_LIMIT {
+            return;
+        }
+        let stored_digest = digest_hex(stored_blob);
+        let (normalized_digest, normalized_bytes, digests_match) =
+            if let Some(bytes) = canonical_blob {
+                let digest = digest_hex(&bytes);
+                let len = bytes.len();
+                let matches = digest == stored_digest;
+                (Some(digest), Some(len), Some(matches))
+            } else {
+                (None, None, None)
+            };
+        self.node_path_samples.push(PathSample {
+            file: file.to_string(),
+            key: local_id.to_string(),
+            stored_digest,
+            stored_bytes: stored_blob.len(),
+            normalized_digest,
+            normalized_bytes,
+            digests_match,
+        });
+    }
+
+    pub(crate) fn record_root_path_blob(
+        &mut self,
+        file: &str,
+        symbol_stack: Option<&str>,
+        stored_blob: &[u8],
+        canonical_blob: Option<Vec<u8>>,
+    ) {
+        self.root_path_records_loaded += 1;
+        self.root_path_bytes_loaded += stored_blob.len();
+        if self.root_path_samples.len() >= PATH_SAMPLE_LIMIT {
+            return;
+        }
+        let stored_digest = digest_hex(stored_blob);
+        let (normalized_digest, normalized_bytes, digests_match) =
+            if let Some(bytes) = canonical_blob {
+                let digest = digest_hex(&bytes);
+                let len = bytes.len();
+                let matches = digest == stored_digest;
+                (Some(digest), Some(len), Some(matches))
+            } else {
+                (None, None, None)
+            };
+        self.root_path_samples.push(PathSample {
+            file: file.to_string(),
+            key: symbol_stack.unwrap_or_default().to_string(),
+            stored_digest,
+            stored_bytes: stored_blob.len(),
+            normalized_digest,
+            normalized_bytes,
+            digests_match,
+        });
+    }
+}
+
+fn digest_hex(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    use std::fmt::Write as _;
+    for byte in digest {
+        let _ = write!(&mut out, "{:02x}", byte);
+    }
+    out
 }
 
 /// Check if the database has the version supported by this library version.

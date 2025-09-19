@@ -272,11 +272,26 @@ impl RedbReader {
             .get(file)?
             .ok_or_else(|| RedbError::Corrupt(format!("missing graph for {file}")))?;
         let record = GraphRecord::decode(value.value())?;
-        let (graph, _) = bincode::decode_from_slice::<serde::StackGraph, _>(
+        let (file_graph, _) = bincode::decode_from_slice::<serde::StackGraph, _>(
             record.graph_blob.as_slice(),
             BINCODE_CONFIG,
         )?;
-        graph.load_into(&mut self.graph)?;
+        let canonical_bytes = if self.stats.should_record_graph_sample() {
+            Some(
+                bincode::encode_to_vec(&file_graph, BINCODE_CONFIG)
+                    .map_err(StorageError::from)
+                    .map_err(RedbError::from)?,
+            )
+        } else {
+            None
+        };
+        self.stats.record_graph_blob(
+            file,
+            Some(record.tag.as_str()),
+            record.graph_blob.as_slice(),
+            canonical_bytes,
+        );
+        file_graph.load_into(&mut self.graph)?;
         let handle = self.graph.get_file(file).expect("loaded file to exist");
         self.loaded_graphs.insert(handle);
         Ok(handle)
@@ -313,7 +328,18 @@ impl RedbReader {
         while let Some(Ok((key, value))) = iter.next() {
             cancellation_flag.check("loading node paths")?;
             let local_id = decode_local_id(key.value())?;
-            let path = decode_partial_path(value.value(), &mut self.graph, &mut self.partials)?;
+            let blob = value.value();
+            let path = decode_partial_path(blob, &mut self.graph, &mut self.partials)?;
+            let canonical_bytes = if self.stats.should_record_node_sample() {
+                let mut buf = Vec::new();
+                encode_partial_path(&self.graph, &mut self.partials, &path, &mut buf)
+                    .map_err(RedbError::from)?;
+                Some(buf)
+            } else {
+                None
+            };
+            self.stats
+                .record_node_path_blob(&file_name, local_id, blob, canonical_bytes);
             self.database
                 .add_partial_path(&self.graph, &mut self.partials, path);
             if let Some(handle) = self.graph.node_for_id(NodeID::new_in_file(file, local_id)) {
@@ -336,9 +362,30 @@ impl RedbReader {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(ROOT_PATHS_BY_FILE_TABLE)?;
         let mut iter = table.range(start.as_slice()..=end.as_slice())?;
-        while let Some(Ok((_key, value))) = iter.next() {
+        while let Some(Ok((key, value))) = iter.next() {
             cancellation_flag.check("loading root paths")?;
-            let path = decode_partial_path(value.value(), &mut self.graph, &mut self.partials)?;
+            let want_sample = self.stats.should_record_root_sample();
+            let symbol_stack_for_sample = if want_sample {
+                Some(decode_root_symbol(key.value())?)
+            } else {
+                None
+            };
+            let blob = value.value();
+            let path = decode_partial_path(blob, &mut self.graph, &mut self.partials)?;
+            let canonical_bytes = if want_sample {
+                let mut buf = Vec::new();
+                encode_partial_path(&self.graph, &mut self.partials, &path, &mut buf)
+                    .map_err(RedbError::from)?;
+                Some(buf)
+            } else {
+                None
+            };
+            self.stats.record_root_path_blob(
+                &file_name,
+                symbol_stack_for_sample.as_deref(),
+                blob,
+                canonical_bytes,
+            );
             let handles = path.symbol_stack_precondition.storage_key_queries(
                 &self.graph,
                 &mut self.partials,

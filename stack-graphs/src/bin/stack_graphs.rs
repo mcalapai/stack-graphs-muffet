@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -12,6 +12,11 @@ use serde::Deserialize;
 use stack_graphs::graph::StackGraph;
 use stack_graphs::partial::{PartialPath, PartialPaths};
 use stack_graphs::serde::{PartialPath as SerdePartialPath, StackGraph as SerdeStackGraph};
+#[cfg(feature = "storage-redb")]
+use stack_graphs::storage::compare::{
+    compare_backends, ComparisonReport, GraphEntry, GraphMismatch, NodePathEntry, NodePathMismatch,
+    RootPathEntry, RootPathMismatch, TableDiff,
+};
 #[cfg(feature = "storage-redb")]
 use stack_graphs::storage::redb::convert_sqlite_to_redb;
 #[cfg(feature = "storage-redb")]
@@ -36,6 +41,8 @@ fn run() -> Result<()> {
         Commands::Convert(args) => handle_convert(args),
         #[cfg(feature = "storage-redb")]
         Commands::InspectRedb(args) => handle_inspect(args),
+        #[cfg(feature = "storage-redb")]
+        Commands::CompareBackends(args) => handle_compare_backends(args),
     }
 }
 
@@ -57,6 +64,9 @@ enum Commands {
     /// Inspect a redb database and display table summaries
     #[cfg(feature = "storage-redb")]
     InspectRedb(InspectArgs),
+    /// Compare SQLite and redb backends and report differences
+    #[cfg(feature = "storage-redb")]
+    CompareBackends(CompareBackendsArgs),
 }
 
 #[derive(Parser)]
@@ -98,6 +108,23 @@ struct InspectArgs {
     /// Table to dump; defaults to graphs summary
     #[arg(long, value_enum, default_value = "graphs")]
     table: InspectTable,
+}
+
+#[cfg(feature = "storage-redb")]
+#[derive(Parser)]
+struct CompareBackendsArgs {
+    /// Path to the reference SQLite database
+    #[arg(long)]
+    sqlite: PathBuf,
+    /// Path to the redb database to compare
+    #[arg(long)]
+    redb: PathBuf,
+    /// Optional path to write a JSON diff report
+    #[arg(long)]
+    diff_output: Option<PathBuf>,
+    /// Maximum number of diff samples to display per category
+    #[arg(long, default_value_t = 20)]
+    max_diff_samples: usize,
 }
 
 #[cfg(feature = "storage-redb")]
@@ -253,6 +280,230 @@ fn handle_inspect(args: InspectArgs) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+#[cfg(feature = "storage-redb")]
+fn handle_compare_backends(args: CompareBackendsArgs) -> Result<()> {
+    let sample_limit = args.max_diff_samples.max(1);
+    let report = compare_backends(&args.sqlite, &args.redb).with_context(|| {
+        format!(
+            "failed to compare {} and {}",
+            args.sqlite.display(),
+            args.redb.display()
+        )
+    })?;
+
+    print_comparison_report(&report, sample_limit);
+
+    if let Some(path) = &args.diff_output {
+        write_diff_report(path, &report)?;
+        println!("Wrote diff report to {}", path.display());
+    }
+
+    if report.has_differences() {
+        bail!("backends differ; see report above");
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "storage-redb")]
+fn print_comparison_report(report: &ComparisonReport, sample_limit: usize) {
+    println!(
+        "Graphs: sqlite={}, redb={}",
+        report.graphs.sqlite_count, report.graphs.redb_count
+    );
+    print_graph_diff(&report.graphs, sample_limit);
+
+    println!(
+        "File paths: sqlite={}, redb={}",
+        report.file_paths.sqlite_count, report.file_paths.redb_count
+    );
+    print_node_path_diff(&report.file_paths, sample_limit);
+
+    println!(
+        "Root paths: sqlite={}, redb={}",
+        report.root_paths.sqlite_count, report.root_paths.redb_count
+    );
+    print_root_path_diff(&report.root_paths, sample_limit);
+}
+
+#[cfg(feature = "storage-redb")]
+fn print_graph_diff(diff: &TableDiff<GraphEntry, GraphMismatch>, sample_limit: usize) {
+    if diff.missing_in_redb.is_empty()
+        && diff.extra_in_redb.is_empty()
+        && diff.mismatched.is_empty()
+    {
+        println!("  match");
+        return;
+    }
+
+    if !diff.missing_in_redb.is_empty() {
+        print_entry_list(
+            "missing in redb",
+            &diff.missing_in_redb,
+            sample_limit,
+            describe_graph_entry,
+        );
+    }
+    if !diff.extra_in_redb.is_empty() {
+        print_entry_list(
+            "extra in redb",
+            &diff.extra_in_redb,
+            sample_limit,
+            describe_graph_entry,
+        );
+    }
+    if !diff.mismatched.is_empty() {
+        println!("  mismatched: {}", diff.mismatched.len());
+        for mismatch in diff.mismatched.iter().take(sample_limit) {
+            println!("    - {}", mismatch.file);
+            println!("      sqlite: {}", describe_graph_entry(&mismatch.sqlite));
+            println!("      redb:   {}", describe_graph_entry(&mismatch.redb));
+            for difference in &mismatch.differences {
+                println!("      diff: {}", difference);
+            }
+        }
+        if diff.mismatched.len() > sample_limit {
+            println!("      ... {} more", diff.mismatched.len() - sample_limit);
+        }
+    }
+}
+
+#[cfg(feature = "storage-redb")]
+fn print_node_path_diff(diff: &TableDiff<NodePathEntry, NodePathMismatch>, sample_limit: usize) {
+    if diff.missing_in_redb.is_empty()
+        && diff.extra_in_redb.is_empty()
+        && diff.mismatched.is_empty()
+    {
+        println!("  match");
+        return;
+    }
+
+    if !diff.missing_in_redb.is_empty() {
+        print_entry_list(
+            "missing in redb",
+            &diff.missing_in_redb,
+            sample_limit,
+            describe_node_entry,
+        );
+    }
+    if !diff.extra_in_redb.is_empty() {
+        print_entry_list(
+            "extra in redb",
+            &diff.extra_in_redb,
+            sample_limit,
+            describe_node_entry,
+        );
+    }
+    if !diff.mismatched.is_empty() {
+        println!("  mismatched: {}", diff.mismatched.len());
+        for mismatch in diff.mismatched.iter().take(sample_limit) {
+            println!("    - {}#{}", mismatch.file, mismatch.local_id);
+            println!("      sqlite: {}", describe_node_entry(&mismatch.sqlite));
+            println!("      redb:   {}", describe_node_entry(&mismatch.redb));
+            for difference in &mismatch.differences {
+                println!("      diff: {}", difference);
+            }
+        }
+        if diff.mismatched.len() > sample_limit {
+            println!("      ... {} more", diff.mismatched.len() - sample_limit);
+        }
+    }
+}
+
+#[cfg(feature = "storage-redb")]
+fn print_root_path_diff(diff: &TableDiff<RootPathEntry, RootPathMismatch>, sample_limit: usize) {
+    if diff.missing_in_redb.is_empty()
+        && diff.extra_in_redb.is_empty()
+        && diff.mismatched.is_empty()
+    {
+        println!("  match");
+        return;
+    }
+
+    if !diff.missing_in_redb.is_empty() {
+        print_entry_list(
+            "missing in redb",
+            &diff.missing_in_redb,
+            sample_limit,
+            describe_root_entry,
+        );
+    }
+    if !diff.extra_in_redb.is_empty() {
+        print_entry_list(
+            "extra in redb",
+            &diff.extra_in_redb,
+            sample_limit,
+            describe_root_entry,
+        );
+    }
+    if !diff.mismatched.is_empty() {
+        println!("  mismatched: {}", diff.mismatched.len());
+        for mismatch in diff.mismatched.iter().take(sample_limit) {
+            println!("    - {} [{}]", mismatch.file, mismatch.symbol_stack);
+            println!("      sqlite: {}", describe_root_entry(&mismatch.sqlite));
+            println!("      redb:   {}", describe_root_entry(&mismatch.redb));
+        }
+        if diff.mismatched.len() > sample_limit {
+            println!("      ... {} more", diff.mismatched.len() - sample_limit);
+        }
+    }
+}
+
+#[cfg(feature = "storage-redb")]
+fn print_entry_list<T, F>(label: &str, entries: &[T], sample_limit: usize, formatter: F)
+where
+    F: Fn(&T) -> String,
+{
+    println!("  {}: {}", label, entries.len());
+    for entry in entries.iter().take(sample_limit) {
+        println!("    - {}", formatter(entry));
+    }
+    if entries.len() > sample_limit {
+        println!("    ... {} more", entries.len() - sample_limit);
+    }
+}
+
+#[cfg(feature = "storage-redb")]
+fn describe_graph_entry(entry: &GraphEntry) -> String {
+    let status = entry.error.as_deref().unwrap_or("indexed");
+    format!(
+        "{} (tag='{}', digest={}, files={}, nodes={}, edges={}, status={})",
+        entry.file,
+        entry.tag,
+        entry.digest,
+        entry.file_count,
+        entry.node_count,
+        entry.edge_count,
+        status
+    )
+}
+
+#[cfg(feature = "storage-redb")]
+fn describe_node_entry(entry: &NodePathEntry) -> String {
+    format!(
+        "{}#{} (digest={}, path={})",
+        entry.file, entry.local_id, entry.digest, entry.summary
+    )
+}
+
+#[cfg(feature = "storage-redb")]
+fn describe_root_entry(entry: &RootPathEntry) -> String {
+    format!(
+        "{} [{}] (digest={}, path={})",
+        entry.file, entry.symbol_stack, entry.digest, entry.summary
+    )
+}
+
+#[cfg(feature = "storage-redb")]
+fn write_diff_report(path: &Path, report: &ComparisonReport) -> Result<()> {
+    let mut file =
+        File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
+    serde_json::to_writer_pretty(&mut file, report)?;
+    file.write_all(b"\n")
+        .with_context(|| format!("failed to finish writing {}", path.display()))?;
     Ok(())
 }
 
