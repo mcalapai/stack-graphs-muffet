@@ -13,8 +13,10 @@ use itertools::Itertools;
 use rusqlite::functions::FunctionFlags;
 use rusqlite::types::{Type, ValueRef};
 use rusqlite::Connection;
+use rusqlite::MappedRows;
 use rusqlite::OptionalExtension;
 use rusqlite::Params;
+use rusqlite::Row;
 use rusqlite::Statement;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -83,6 +85,16 @@ const PRAGMAS: &str = r#"
 
 pub static BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
 
+#[cfg(storage_has_sqlite)]
+pub const STORAGE_SQLITE_ENABLED: bool = true;
+#[cfg(not(storage_has_sqlite))]
+pub const STORAGE_SQLITE_ENABLED: bool = false;
+
+#[cfg(storage_has_redb)]
+pub const STORAGE_REDB_ENABLED: bool = true;
+#[cfg(not(storage_has_redb))]
+pub const STORAGE_REDB_ENABLED: bool = false;
+
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("cancelled at {0}")]
@@ -139,21 +151,155 @@ pub struct FileEntry {
     pub status: FileStatus,
 }
 
+/// References to the core graph, partial paths, and database backing a storage reader.
+pub type StorageComponents<'a> = (&'a mut StackGraph, &'a mut PartialPaths, &'a mut Database);
+
+/// Trait for database file listings that can yield [`FileEntry`] values.
+pub trait StorageFileListing<'a> {
+    type Error;
+    type Iter: Iterator<Item = std::result::Result<FileEntry, Self::Error>> + 'a;
+
+    fn try_iter(&'a mut self) -> std::result::Result<Self::Iter, Self::Error>;
+}
+
+/// Iterator wrapper yielding [`FileEntry`] values from a SQLite query.
+pub struct SqliteFileEntries<'stmt> {
+    rows: MappedRows<'stmt, fn(&Row<'_>) -> rusqlite::Result<FileEntry>>,
+}
+
+impl<'stmt> Iterator for SqliteFileEntries<'stmt> {
+    type Item = Result<FileEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.rows.next().map(|row| row.map_err(StorageError::from))
+    }
+}
+
+fn row_to_file_entry(row: &Row<'_>) -> rusqlite::Result<FileEntry> {
+    Ok(FileEntry {
+        path: PathBuf::from(row.get::<_, String>(0)?),
+        tag: row.get::<_, String>(1)?,
+        status: row.get_ref(2)?.into(),
+    })
+}
+
 /// An iterator over a query returning rows with (path,tag,error) tuples.
 pub struct Files<'a, P: Params>(Statement<'a>, P);
 
 impl<'a, P: Params + Clone> Files<'a, P> {
-    pub fn try_iter<'b>(&'b mut self) -> Result<impl Iterator<Item = Result<FileEntry>> + 'b> {
-        let entries = self.0.query_map(self.1.clone(), |r| {
-            Ok(FileEntry {
-                path: PathBuf::from(r.get::<_, String>(0)?),
-                tag: r.get::<_, String>(1)?,
-                status: r.get_ref(2)?.into(),
-            })
-        })?;
-        let entries = entries.map(|r| -> Result<FileEntry> { Ok(r?) });
-        Ok(entries)
+    pub fn try_iter(&mut self) -> Result<SqliteFileEntries<'_>> {
+        let rows = self
+            .0
+            .query_map(self.1.clone(), row_to_file_entry as fn(&Row<'_>) -> rusqlite::Result<FileEntry>)?;
+        Ok(SqliteFileEntries { rows })
     }
+}
+
+impl<'a, P> StorageFileListing<'a> for Files<'a, P>
+where
+    P: Params + Clone,
+{
+    type Error = StorageError;
+    type Iter = SqliteFileEntries<'a>;
+
+    fn try_iter(&'a mut self) -> std::result::Result<Self::Iter, Self::Error> {
+        Files::try_iter(self)
+    }
+}
+
+/// Trait covering read-side operations for stack-graph storage backends.
+pub trait StorageReader {
+    type Error: From<CancellationError>;
+    type ListAll<'a>: StorageFileListing<'a, Error = Self::Error>
+    where
+        Self: 'a;
+    type ListByPath<'a>: StorageFileListing<'a, Error = Self::Error>
+    where
+        Self: 'a;
+
+    fn clear(&mut self);
+    fn clear_paths(&mut self);
+    fn status_for_file<T: AsRef<str>>(
+        &mut self,
+        file: &str,
+        tag: Option<T>,
+    ) -> std::result::Result<FileStatus, Self::Error>;
+    fn list_all(&mut self) -> std::result::Result<Self::ListAll<'_>, Self::Error>;
+    fn list_file_or_directory(
+        &mut self,
+        file_or_directory: &Path,
+    ) -> std::result::Result<Self::ListByPath<'_>, Self::Error>;
+    fn load_graph_for_file(&mut self, file: &str)
+        -> std::result::Result<Handle<File>, Self::Error>;
+    fn load_graphs_for_file_or_directory(
+        &mut self,
+        file_or_directory: &Path,
+        cancellation_flag: &dyn CancellationFlag,
+    ) -> std::result::Result<(), Self::Error>;
+    fn preload_node_paths_for_file(
+        &mut self,
+        file: Handle<File>,
+        cancellation_flag: &dyn CancellationFlag,
+    ) -> std::result::Result<(), Self::Error>;
+    fn preload_root_paths_for_file(
+        &mut self,
+        file: Handle<File>,
+        cancellation_flag: &dyn CancellationFlag,
+    ) -> std::result::Result<(), Self::Error>;
+    fn load_partial_path_extensions(
+        &mut self,
+        path: &PartialPath,
+        cancellation_flag: &dyn CancellationFlag,
+    ) -> std::result::Result<(), Self::Error>;
+    fn graph(&self) -> &StackGraph;
+    fn database(&self) -> &Database;
+    fn components_mut(&mut self) -> StorageComponents<'_>;
+    fn stats(&self) -> Stats;
+}
+
+/// Trait covering write-side operations for stack-graph storage backends.
+pub trait StorageWriter {
+    type Error;
+    type Reader: StorageReader<Error = Self::Error>;
+
+    fn open_in_memory() -> std::result::Result<Self, Self::Error>
+    where
+        Self: Sized;
+
+    fn open<P: AsRef<Path>>(path: P) -> std::result::Result<Self, Self::Error>
+    where
+        Self: Sized;
+
+    fn clean_all(&mut self) -> std::result::Result<usize, Self::Error>;
+    fn clean_file(&mut self, file: &Path) -> std::result::Result<usize, Self::Error>;
+    fn clean_file_or_directory(
+        &mut self,
+        file_or_directory: &Path,
+    ) -> std::result::Result<usize, Self::Error>;
+    fn store_error_for_file(
+        &mut self,
+        file: &Path,
+        tag: &str,
+        error: &str,
+    ) -> std::result::Result<(), Self::Error>;
+    fn store_result_for_file<'a, IP>(
+        &mut self,
+        graph: &StackGraph,
+        file: Handle<File>,
+        tag: &str,
+        partials: &mut PartialPaths,
+        paths: IP,
+    ) -> std::result::Result<(), Self::Error>
+    where
+        IP: IntoIterator<Item = &'a PartialPath>;
+    fn status_for_file(
+        &mut self,
+        file: &str,
+        tag: Option<&str>,
+    ) -> std::result::Result<FileStatus, Self::Error>;
+    fn into_reader(self) -> std::result::Result<Self::Reader, Self::Error>
+    where
+        Self: Sized;
 }
 
 /// Writer to store stack graphs and partial paths in a SQLite database.
@@ -446,6 +592,69 @@ impl SQLiteWriter {
             stats: Stats::default(),
             symbol_stack_queries: SymbolStackQueryPool::new(),
         }
+    }
+}
+
+impl StorageWriter for SQLiteWriter {
+    type Error = StorageError;
+    type Reader = SQLiteReader;
+
+    fn open_in_memory() -> std::result::Result<Self, Self::Error> {
+        SQLiteWriter::open_in_memory()
+    }
+
+    fn open<P: AsRef<Path>>(path: P) -> std::result::Result<Self, Self::Error> {
+        SQLiteWriter::open(path)
+    }
+
+    fn clean_all(&mut self) -> std::result::Result<usize, Self::Error> {
+        SQLiteWriter::clean_all(self)
+    }
+
+    fn clean_file(&mut self, file: &Path) -> std::result::Result<usize, Self::Error> {
+        SQLiteWriter::clean_file(self, file)
+    }
+
+    fn clean_file_or_directory(
+        &mut self,
+        file_or_directory: &Path,
+    ) -> std::result::Result<usize, Self::Error> {
+        SQLiteWriter::clean_file_or_directory(self, file_or_directory)
+    }
+
+    fn store_error_for_file(
+        &mut self,
+        file: &Path,
+        tag: &str,
+        error: &str,
+    ) -> std::result::Result<(), Self::Error> {
+        SQLiteWriter::store_error_for_file(self, file, tag, error)
+    }
+
+    fn store_result_for_file<'a, IP>(
+        &mut self,
+        graph: &StackGraph,
+        file: Handle<File>,
+        tag: &str,
+        partials: &mut PartialPaths,
+        paths: IP,
+    ) -> std::result::Result<(), Self::Error>
+    where
+        IP: IntoIterator<Item = &'a PartialPath>,
+    {
+        SQLiteWriter::store_result_for_file(self, graph, file, tag, partials, paths)
+    }
+
+    fn status_for_file(
+        &mut self,
+        file: &str,
+        tag: Option<&str>,
+    ) -> std::result::Result<FileStatus, Self::Error> {
+        SQLiteWriter::status_for_file(self, file, tag)
+    }
+
+    fn into_reader(self) -> std::result::Result<Self::Reader, Self::Error> {
+        Ok(SQLiteWriter::into_reader(self))
     }
 }
 
@@ -890,6 +1099,101 @@ impl SQLiteReader {
     }
 }
 
+impl StorageReader for SQLiteReader {
+    type Error = StorageError;
+    type ListAll<'a>
+        = Files<'a, ()>
+    where
+        Self: 'a;
+    type ListByPath<'a>
+        = Files<'a, [String; 1]>
+    where
+        Self: 'a;
+
+    fn clear(&mut self) {
+        SQLiteReader::clear(self);
+    }
+
+    fn clear_paths(&mut self) {
+        SQLiteReader::clear_paths(self);
+    }
+
+    fn status_for_file<T: AsRef<str>>(
+        &mut self,
+        file: &str,
+        tag: Option<T>,
+    ) -> std::result::Result<FileStatus, Self::Error> {
+        SQLiteReader::status_for_file(self, file, tag.as_ref().map(|t| t.as_ref()))
+    }
+
+    fn list_all(&mut self) -> std::result::Result<Self::ListAll<'_>, Self::Error> {
+        SQLiteReader::list_all(self)
+    }
+
+    fn list_file_or_directory(
+        &mut self,
+        file_or_directory: &Path,
+    ) -> std::result::Result<Self::ListByPath<'_>, Self::Error> {
+        SQLiteReader::list_file_or_directory_inner(&self.conn, file_or_directory)
+    }
+
+    fn load_graph_for_file(
+        &mut self,
+        file: &str,
+    ) -> std::result::Result<Handle<File>, Self::Error> {
+        SQLiteReader::load_graph_for_file(self, file)
+    }
+
+    fn load_graphs_for_file_or_directory(
+        &mut self,
+        file_or_directory: &Path,
+        cancellation_flag: &dyn CancellationFlag,
+    ) -> std::result::Result<(), Self::Error> {
+        SQLiteReader::load_graphs_for_file_or_directory(self, file_or_directory, cancellation_flag)
+    }
+
+    fn preload_node_paths_for_file(
+        &mut self,
+        file: Handle<File>,
+        cancellation_flag: &dyn CancellationFlag,
+    ) -> std::result::Result<(), Self::Error> {
+        SQLiteReader::preload_node_paths_for_file(self, file, cancellation_flag)
+    }
+
+    fn preload_root_paths_for_file(
+        &mut self,
+        file: Handle<File>,
+        cancellation_flag: &dyn CancellationFlag,
+    ) -> std::result::Result<(), Self::Error> {
+        let file_name = self.graph[file].name().to_string();
+        SQLiteReader::preload_root_paths_for_file(self, &file_name, cancellation_flag)
+    }
+
+    fn load_partial_path_extensions(
+        &mut self,
+        path: &PartialPath,
+        cancellation_flag: &dyn CancellationFlag,
+    ) -> std::result::Result<(), Self::Error> {
+        SQLiteReader::load_partial_path_extensions(self, path, cancellation_flag)
+    }
+
+    fn graph(&self) -> &StackGraph {
+        &self.graph
+    }
+
+    fn database(&self) -> &Database {
+        &self.db
+    }
+
+    fn components_mut(&mut self) -> StorageComponents<'_> {
+        (&mut self.graph, &mut self.partials, &mut self.db)
+    }
+
+    fn stats(&self) -> Stats {
+        SQLiteReader::stats(self)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum SymbolStackExactVariant {
     /// Matches a `V`-prefixed storage key for an exact symbol stack prefix.
@@ -1093,29 +1397,33 @@ impl PartialSymbolStack {
     }
 }
 
-impl ForwardCandidates<Handle<PartialPath>, PartialPath, Database, StorageError> for SQLiteReader {
+impl<T> ForwardCandidates<Handle<PartialPath>, PartialPath, Database, T::Error> for T
+where
+    T: StorageReader + ?Sized,
+{
     fn load_forward_candidates(
         &mut self,
         path: &PartialPath,
         cancellation_flag: &dyn CancellationFlag,
-    ) -> std::result::Result<(), StorageError> {
-        self.load_partial_path_extensions(path, cancellation_flag)
+    ) -> std::result::Result<(), T::Error> {
+        StorageReader::load_partial_path_extensions(self, path, cancellation_flag)
     }
 
     fn get_forward_candidates<R>(&mut self, path: &PartialPath, result: &mut R)
     where
         R: std::iter::Extend<Handle<PartialPath>>,
     {
-        self.db
-            .find_candidate_partial_paths(&self.graph, &mut self.partials, path, result);
+        let (graph, partials, db) = StorageReader::components_mut(self);
+        db.find_candidate_partial_paths(&*graph, partials, path, result);
     }
 
     fn get_joining_candidate_degree(&self, path: &PartialPath) -> Degree {
-        self.db.get_incoming_path_degree(path.end_node)
+        StorageReader::database(self).get_incoming_path_degree(path.end_node)
     }
 
     fn get_graph_partials_and_db(&mut self) -> (&StackGraph, &mut PartialPaths, &Database) {
-        (&self.graph, &mut self.partials, &self.db)
+        let (graph, partials, db) = StorageReader::components_mut(self);
+        (&*graph, partials, &*db)
     }
 }
 

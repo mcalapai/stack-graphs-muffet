@@ -8,158 +8,215 @@
 use itertools::Itertools;
 use stack_graphs::graph::StackGraph;
 use stack_graphs::partial::PartialPaths;
-use stack_graphs::storage::SQLiteWriter;
+use stack_graphs::storage::{
+    SQLiteReader, SQLiteWriter, StorageError, StorageReader, StorageWriter,
+};
 use stack_graphs::NoCancellation;
 
 use crate::util::create_partial_path_and_edges;
 use crate::util::create_pop_symbol_node;
 use crate::util::create_push_symbol_node;
 
-fn test_foo_bar_root_candidate_paths(symbols: &[&str], variable: bool) -> usize {
-    let mut reader = {
-        let mut writer = SQLiteWriter::open_in_memory().unwrap();
+trait StorageTestBackend {
+    type Error: std::fmt::Display;
+    type Writer: StorageWriter<Error = Self::Error>;
+    type Reader: StorageReader<Error = Self::Error>;
 
-        let mut graph = StackGraph::new();
-        let file = graph.add_file("test1").unwrap();
-        let mut partials = PartialPaths::new();
+    fn name() -> &'static str;
+    fn create_writer() -> Result<Self::Writer, Self::Error>;
+    fn into_reader(writer: Self::Writer) -> Result<Self::Reader, Self::Error>;
+}
 
-        let r = StackGraph::root_node();
-        let foo = create_pop_symbol_node(&mut graph, file, "foo", true);
-        let bar = create_pop_symbol_node(&mut graph, file, "bar", true);
+fn expect_ok<B, T>(result: Result<T, B::Error>) -> T
+where
+    B: StorageTestBackend,
+    B::Error: std::fmt::Display,
+{
+    result.unwrap_or_else(|err| panic!("{} backend failed: {}", B::name(), err))
+}
 
-        let path_with_variable =
-            create_partial_path_and_edges(&mut graph, &mut partials, &[r, foo, bar]).unwrap();
+struct SqliteBackend;
 
-        let mut path_without_variable = path_with_variable.clone();
-        path_without_variable.eliminate_precondition_stack_variables(&mut partials);
+impl StorageTestBackend for SqliteBackend {
+    type Error = StorageError;
+    type Writer = SQLiteWriter;
+    type Reader = SQLiteReader;
 
-        writer
-            .store_result_for_file(
-                &graph,
-                file,
-                "",
-                &mut partials,
-                vec![&path_with_variable, &path_without_variable],
-            )
-            .unwrap();
+    fn name() -> &'static str {
+        "sqlite"
+    }
 
-        writer.into_reader()
-    };
+    fn create_writer() -> Result<Self::Writer, Self::Error> {
+        SQLiteWriter::open_in_memory()
+    }
 
-    {
-        let (graph, partials, _) = reader.get();
+    fn into_reader(writer: Self::Writer) -> Result<Self::Reader, Self::Error> {
+        StorageWriter::into_reader(writer)
+    }
+}
+
+macro_rules! run_for_backends {
+    ($test_fn:ident) => {{
+        $test_fn::<SqliteBackend>();
+        #[cfg(feature = "storage-redb")]
+        {
+            // Additional backends will be added when storage-redb is implemented.
+        }
+    }};
+}
+
+fn test_foo_bar_root_candidate_paths<B: StorageTestBackend>(
+    symbols: &[&str],
+    variable: bool,
+) -> usize {
+    let mut writer = expect_ok::<B, _>(B::create_writer());
+
+    let mut graph = StackGraph::new();
+    let file = graph.add_file("test1").unwrap();
+    let mut partials = PartialPaths::new();
+
+    let r = StackGraph::root_node();
+    let foo = create_pop_symbol_node(&mut graph, file, "foo", true);
+    let bar = create_pop_symbol_node(&mut graph, file, "bar", true);
+
+    let path_with_variable =
+        create_partial_path_and_edges(&mut graph, &mut partials, &[r, foo, bar]).unwrap();
+
+    let mut path_without_variable = path_with_variable.clone();
+    path_without_variable.eliminate_precondition_stack_variables(&mut partials);
+
+    expect_ok::<B, _>(StorageWriter::store_result_for_file(
+        &mut writer,
+        &graph,
+        file,
+        "",
+        &mut partials,
+        vec![&path_with_variable, &path_without_variable],
+    ));
+
+    let mut reader = expect_ok::<B, _>(B::into_reader(writer));
+
+    let path = {
+        let (graph, partials, _) = reader.components_mut();
         let file = graph.add_file("test2").unwrap();
 
         let r = StackGraph::root_node();
         let refs = symbols
-            .into_iter()
-            .map(|r| create_push_symbol_node(graph, file, *r, true))
+            .iter()
+            .map(|symbol| create_push_symbol_node(graph, file, *symbol, true))
             .chain(std::iter::once(r))
             .collect_vec();
         let mut path = create_partial_path_and_edges(graph, partials, &refs).unwrap();
         if !variable {
             path.eliminate_precondition_stack_variables(partials);
         }
+        path
+    };
 
-        reader
-            .load_partial_path_extensions(&path, &NoCancellation)
-            .unwrap();
+    expect_ok::<B, _>(reader.load_partial_path_extensions(&path, &NoCancellation));
 
-        let (graph, partials, db) = reader.get();
-        let mut results = Vec::new();
-        db.find_candidate_partial_paths_from_root(
-            graph,
-            partials,
-            Some(path.symbol_stack_postcondition),
-            &mut results,
-        );
+    let (graph, partials, db) = reader.components_mut();
+    let mut results = Vec::new();
+    db.find_candidate_partial_paths_from_root(
+        &*graph,
+        partials,
+        Some(path.symbol_stack_postcondition),
+        &mut results,
+    );
 
-        results.len()
-    }
+    results.len()
+}
+
+fn find_candidates_for_exact_symbol_stack_with_variable_impl<B: StorageTestBackend>() {
+    let results = test_foo_bar_root_candidate_paths::<B>(&["bar", "foo"], true);
+    assert_eq!(2, results, "backend {}", B::name());
 }
 
 #[test]
 fn find_candidates_for_exact_symbol_stack_with_variable() {
-    // <"foo","bar",%2> ~ <"foo","bar",%1> | yes, %2 = %1
-    // <"foo","bar",%2> ~ <"foo","bar">    | yes, %2 = <>
-    let results = test_foo_bar_root_candidate_paths(&["bar", "foo"], true);
-    assert_eq!(2, results);
+    run_for_backends!(find_candidates_for_exact_symbol_stack_with_variable_impl);
+}
+
+fn find_candidates_for_exact_symbol_stack_without_variable_impl<B: StorageTestBackend>() {
+    let results = test_foo_bar_root_candidate_paths::<B>(&["bar", "foo"], false);
+    assert_eq!(2, results, "backend {}", B::name());
 }
 
 #[test]
 fn find_candidates_for_exact_symbol_stack_without_variable() {
-    // <"foo","bar"> ~ <"foo","bar",%1> | yes, %1 = <>
-    // <"foo","bar"> ~ <"foo","bar">    | yes
-    let results = test_foo_bar_root_candidate_paths(&["bar", "foo"], false);
-    assert_eq!(2, results);
+    run_for_backends!(find_candidates_for_exact_symbol_stack_without_variable_impl);
+}
+
+fn find_candidates_for_longer_symbol_stack_with_variable_impl<B: StorageTestBackend>() {
+    let results = test_foo_bar_root_candidate_paths::<B>(&["quz", "bar", "foo"], true);
+    assert_eq!(1, results, "backend {}", B::name());
 }
 
 #[test]
 fn find_candidates_for_longer_symbol_stack_with_variable() {
-    // <"foo","bar","quz",%2> ~ <"foo","bar",%1> | yes, %1 = <"quz",%2>
-    // <"foo","bar","quz",%2> ~ <"foo","bar">    | no
-    let results = test_foo_bar_root_candidate_paths(&["quz", "bar", "foo"], true);
-    assert_eq!(1, results);
+    run_for_backends!(find_candidates_for_longer_symbol_stack_with_variable_impl);
+}
+
+fn find_candidates_for_longer_symbol_stack_without_variable_impl<B: StorageTestBackend>() {
+    let results = test_foo_bar_root_candidate_paths::<B>(&["quz", "bar", "foo"], false);
+    assert_eq!(1, results, "backend {}", B::name());
 }
 
 #[test]
 fn find_candidates_for_longer_symbol_stack_without_variable() {
-    // <"foo","bar","quz"> ~ <"foo","bar",%1> | yes, %1 = <"quz">
-    // <"foo","bar","quz"> ~ <"foo","bar">    | no
-    let results = test_foo_bar_root_candidate_paths(&["quz", "bar", "foo"], false);
-    assert_eq!(1, results);
+    run_for_backends!(find_candidates_for_longer_symbol_stack_without_variable_impl);
+}
+
+fn find_candidates_for_shorter_symbol_stack_with_variable_impl<B: StorageTestBackend>() {
+    let results = test_foo_bar_root_candidate_paths::<B>(&["foo"], true);
+    assert_eq!(2, results, "backend {}", B::name());
 }
 
 #[test]
 fn find_candidates_for_shorter_symbol_stack_with_variable() {
-    // <"foo",%2> ~ <"foo","bar",%1> | yes, %2 = <"bar",%1>
-    // <"foo",%2> ~ <"foo","bar">    | yes, %2 = <"bar">
-    let results = test_foo_bar_root_candidate_paths(&["foo"], true);
-    assert_eq!(2, results);
+    run_for_backends!(find_candidates_for_shorter_symbol_stack_with_variable_impl);
+}
+
+fn find_candidates_for_shorter_symbol_stack_without_variable_impl<B: StorageTestBackend>() {
+    let results = test_foo_bar_root_candidate_paths::<B>(&["foo"], false);
+    assert_eq!(0, results, "backend {}", B::name());
 }
 
 #[test]
 fn find_candidates_for_shorter_symbol_stack_without_variable() {
-    // <"foo"> ~ <"foo","bar",%1> | no
-    // <"foo"> ~ <"foo","bar">    | no
-    let results = test_foo_bar_root_candidate_paths(&["foo"], false);
-    assert_eq!(0, results);
+    run_for_backends!(find_candidates_for_shorter_symbol_stack_without_variable_impl);
 }
 
-#[test]
-fn find_candidates_for_symbol_stack_with_wildcard_symbols() {
-    let mut reader = {
-        let mut writer = SQLiteWriter::open_in_memory().unwrap();
+fn find_candidates_for_symbol_stack_with_wildcard_symbols_impl<B: StorageTestBackend>() {
+    let mut writer = expect_ok::<B, _>(B::create_writer());
 
-        let mut graph = StackGraph::new();
-        let file = graph.add_file("special_defs").unwrap();
-        let mut partials = PartialPaths::new();
+    let mut graph = StackGraph::new();
+    let file = graph.add_file("special_defs").unwrap();
+    let mut partials = PartialPaths::new();
 
-        let r = StackGraph::root_node();
-        let sym_a = create_pop_symbol_node(&mut graph, file, "na_me%", true);
-        let sym_b = create_pop_symbol_node(&mut graph, file, "other_%value", true);
+    let r = StackGraph::root_node();
+    let sym_a = create_pop_symbol_node(&mut graph, file, "na_me%", true);
+    let sym_b = create_pop_symbol_node(&mut graph, file, "other_%value", true);
 
-        let path_with_variable =
-            create_partial_path_and_edges(&mut graph, &mut partials, &[r, sym_a, sym_b]).unwrap();
+    let path_with_variable =
+        create_partial_path_and_edges(&mut graph, &mut partials, &[r, sym_a, sym_b]).unwrap();
 
-        let mut path_without_variable = path_with_variable.clone();
-        path_without_variable.eliminate_precondition_stack_variables(&mut partials);
+    let mut path_without_variable = path_with_variable.clone();
+    path_without_variable.eliminate_precondition_stack_variables(&mut partials);
 
-        writer
-            .store_result_for_file(
-                &graph,
-                file,
-                "",
-                &mut partials,
-                vec![&path_with_variable, &path_without_variable],
-            )
-            .unwrap();
+    expect_ok::<B, _>(StorageWriter::store_result_for_file(
+        &mut writer,
+        &graph,
+        file,
+        "",
+        &mut partials,
+        vec![&path_with_variable, &path_without_variable],
+    ));
 
-        writer.into_reader()
-    };
+    let mut reader = expect_ok::<B, _>(B::into_reader(writer));
 
-    {
-        let (graph, partials, _) = reader.get();
+    let path = {
+        let (graph, partials, _) = reader.components_mut();
         let file = graph.add_file("special_refs").unwrap();
 
         let r = StackGraph::root_node();
@@ -168,21 +225,24 @@ fn find_candidates_for_symbol_stack_with_wildcard_symbols() {
             .map(|symbol| create_push_symbol_node(graph, file, *symbol, true))
             .chain(std::iter::once(r))
             .collect_vec();
-        let path = create_partial_path_and_edges(graph, partials, &refs).unwrap();
+        create_partial_path_and_edges(graph, partials, &refs).unwrap()
+    };
 
-        reader
-            .load_partial_path_extensions(&path, &NoCancellation)
-            .unwrap();
+    expect_ok::<B, _>(reader.load_partial_path_extensions(&path, &NoCancellation));
 
-        let (graph, partials, db) = reader.get();
-        let mut results = Vec::new();
-        db.find_candidate_partial_paths_from_root(
-            graph,
-            partials,
-            Some(path.symbol_stack_postcondition),
-            &mut results,
-        );
+    let (graph, partials, db) = reader.components_mut();
+    let mut results = Vec::new();
+    db.find_candidate_partial_paths_from_root(
+        &*graph,
+        partials,
+        Some(path.symbol_stack_postcondition),
+        &mut results,
+    );
 
-        assert_eq!(2, results.len());
-    }
+    assert_eq!(2, results.len(), "backend {}", B::name());
+}
+
+#[test]
+fn find_candidates_for_symbol_stack_with_wildcard_symbols() {
+    run_for_backends!(find_candidates_for_symbol_stack_with_wildcard_symbols_impl);
 }

@@ -17,6 +17,7 @@ bincode = ["dep:bincode", "lsp-positions/bincode"]
 copious-debugging = []
 serde = ["dep:serde", "serde_with", "lsp-positions/serde"]
 storage = ["bincode", "rusqlite"]
+storage-redb = ["storage"]
 visualization = ["serde", "serde_json"]
 
 [lib]

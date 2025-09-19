@@ -71,7 +71,7 @@ pub mod paths;
 pub mod serde;
 pub mod stats;
 pub mod stitching;
-#[cfg(feature = "storage")]
+#[cfg(any(feature = "storage", feature = "storage-redb"))]
 pub mod storage;
 pub(crate) mod utils;
 #[cfg(feature = "visualization")]
