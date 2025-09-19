@@ -314,6 +314,7 @@ pub trait StorageWriter {
     fn into_reader(self) -> std::result::Result<Self::Reader, Self::Error>
     where
         Self: Sized;
+    fn stats(&self) -> WriteStats;
 }
 
 /// Writer to store stack graphs and partial paths in a SQLite database.
@@ -321,6 +322,7 @@ pub struct SQLiteWriter {
     conn: Connection,
     /// Reusable encode buffer to avoid per-call Vec allocation (DHAT PP 1.7)
     buf: Vec<u8>,
+    stats: WriteStats,
 }
 
 impl SQLiteWriter {
@@ -332,6 +334,7 @@ impl SQLiteWriter {
         Ok(Self {
             conn,
             buf: Vec::new(),
+            stats: WriteStats::default(),
         })
     }
 
@@ -350,6 +353,7 @@ impl SQLiteWriter {
         Ok(Self {
             conn,
             buf: Vec::new(),
+            stats: WriteStats::default(),
         })
     }
 
@@ -454,7 +458,7 @@ impl SQLiteWriter {
     /// Store an error, indicating that indexing this file failed.
     pub fn store_error_for_file(&mut self, file: &Path, tag: &str, error: &str) -> Result<()> {
         let tx = self.conn.transaction()?;
-        Self::store_error_for_file_inner(&tx, file, tag, error, &mut self.buf)?;
+        Self::store_error_for_file_inner(&tx, file, tag, error, &mut self.buf, &mut self.stats)?;
         tx.commit()?;
         Ok(())
     }
@@ -468,13 +472,16 @@ impl SQLiteWriter {
         tag: &str,
         error: &str,
         buf: &mut Vec<u8>,
+        stats: &mut WriteStats,
     ) -> Result<()> {
         copious_debugging!("--> Store error for {}", file.display());
         let mut stmt = conn
             .prepare_cached("INSERT INTO graphs (file, tag, error, value) VALUES (?, ?, ?, ?)")?;
         let graph = crate::serde::StackGraph::default();
         let serialized = encode_into_buf(&graph, buf)?;
-        stmt.execute((&file.to_string_lossy(), tag, error, serialized))?;
+        let file_str = file.to_string_lossy().to_string();
+        stmt.execute((&file_str, tag, error, serialized))?;
+        stats.record_graph_write(&file_str, tag, serialized);
         Ok(())
     }
 
@@ -493,8 +500,16 @@ impl SQLiteWriter {
         let path = Path::new(graph[file].name());
         let tx = self.conn.transaction()?;
         Self::clean_file_inner(&tx, path)?;
-        Self::store_graph_for_file_inner(&tx, graph, file, tag, &mut self.buf)?;
-        Self::store_partial_paths_for_file_inner(&tx, graph, file, partials, paths, &mut self.buf)?;
+        Self::store_graph_for_file_inner(&tx, graph, file, tag, &mut self.buf, &mut self.stats)?;
+        Self::store_partial_paths_for_file_inner(
+            &tx,
+            graph,
+            file,
+            partials,
+            paths,
+            &mut self.buf,
+            &mut self.stats,
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -508,6 +523,7 @@ impl SQLiteWriter {
         file: Handle<File>,
         tag: &str,
         buf: &mut Vec<u8>,
+        stats: &mut WriteStats,
     ) -> Result<()> {
         let file_str = graph[file].name();
         copious_debugging!("--> Store graph for {}", file_str);
@@ -516,6 +532,7 @@ impl SQLiteWriter {
         let graph = serde::StackGraph::from_graph_filter(graph, &FileFilter(file));
         let serialized = encode_into_buf(&graph, buf)?;
         stmt.execute((file_str, tag, serialized))?;
+        stats.record_graph_write(file_str, tag, serialized);
         Ok(())
     }
 
@@ -529,6 +546,7 @@ impl SQLiteWriter {
         partials: &mut PartialPaths,
         paths: IP,
         buf: &mut Vec<u8>,
+        stats: &mut WriteStats,
     ) -> Result<()>
     where
         IP: IntoIterator<Item = &'a PartialPath>,
@@ -560,7 +578,8 @@ impl SQLiteWriter {
                     path.symbol_stack_precondition.display(graph, partials),
                 );
                 let symbol_stack = path.symbol_stack_precondition.storage_key(graph, partials);
-                root_stmt.execute((file_str, symbol_stack, serialized))?;
+                root_stmt.execute((file_str, &symbol_stack, serialized))?;
+                stats.record_root_path_write(file_str, &symbol_stack, serialized);
                 root_path_count += 1;
             } else if start_node.is_in_file(file) {
                 copious_debugging!(
@@ -568,6 +587,7 @@ impl SQLiteWriter {
                     path.start_node.display(graph),
                 );
                 node_stmt.execute((file_str, start_node.local_id(), serialized))?;
+                stats.record_node_path_write(file_str, start_node.local_id(), serialized);
                 node_path_count += 1;
             } else {
                 panic!(
@@ -669,6 +689,10 @@ impl StorageWriter for SQLiteWriter {
 
     fn into_reader(self) -> std::result::Result<Self::Reader, Self::Error> {
         Ok(SQLiteWriter::into_reader(self))
+    }
+
+    fn stats(&self) -> WriteStats {
+        self.stats.clone()
     }
 }
 
@@ -1661,6 +1685,96 @@ impl Stats {
             normalized_bytes,
             digests_match,
         });
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WriteStats {
+    pub graphs_written: usize,
+    pub graph_bytes_written: usize,
+    pub graph_samples: Vec<GraphSample>,
+    pub node_paths_written: usize,
+    pub node_path_bytes_written: usize,
+    pub node_path_samples: Vec<PathSample>,
+    pub root_paths_written: usize,
+    pub root_path_bytes_written: usize,
+    pub root_path_samples: Vec<PathSample>,
+}
+
+impl WriteStats {
+    fn record_graph_write(&mut self, file: &str, tag: &str, blob: &[u8]) {
+        self.graphs_written += 1;
+        self.graph_bytes_written += blob.len();
+        if self.graph_samples.len() >= GRAPH_SAMPLE_LIMIT {
+            return;
+        }
+        self.graph_samples.push(GraphSample {
+            file: file.to_string(),
+            tag: tag.to_string(),
+            stored_digest: digest_hex(blob),
+            stored_bytes: blob.len(),
+            normalized_digest: None,
+            normalized_bytes: None,
+            digests_match: None,
+        });
+    }
+
+    fn record_node_path_write(&mut self, file: &str, local_id: u32, blob: &[u8]) {
+        self.node_paths_written += 1;
+        self.node_path_bytes_written += blob.len();
+        if self.node_path_samples.len() >= PATH_SAMPLE_LIMIT {
+            return;
+        }
+        self.node_path_samples.push(PathSample {
+            file: file.to_string(),
+            key: local_id.to_string(),
+            stored_digest: digest_hex(blob),
+            stored_bytes: blob.len(),
+            normalized_digest: None,
+            normalized_bytes: None,
+            digests_match: None,
+        });
+    }
+
+    fn record_root_path_write(&mut self, file: &str, symbol_stack: &str, blob: &[u8]) {
+        self.root_paths_written += 1;
+        self.root_path_bytes_written += blob.len();
+        if self.root_path_samples.len() >= PATH_SAMPLE_LIMIT {
+            return;
+        }
+        self.root_path_samples.push(PathSample {
+            file: file.to_string(),
+            key: symbol_stack.to_string(),
+            stored_digest: digest_hex(blob),
+            stored_bytes: blob.len(),
+            normalized_digest: None,
+            normalized_bytes: None,
+            digests_match: None,
+        });
+    }
+
+    pub fn merge_from(&mut self, other: &WriteStats) {
+        self.graphs_written += other.graphs_written;
+        self.graph_bytes_written += other.graph_bytes_written;
+        self.node_paths_written += other.node_paths_written;
+        self.node_path_bytes_written += other.node_path_bytes_written;
+        self.root_paths_written += other.root_paths_written;
+        self.root_path_bytes_written += other.root_path_bytes_written;
+        if self.graph_samples.len() < GRAPH_SAMPLE_LIMIT {
+            let remaining = GRAPH_SAMPLE_LIMIT - self.graph_samples.len();
+            self.graph_samples
+                .extend(other.graph_samples.iter().take(remaining).cloned());
+        }
+        if self.node_path_samples.len() < PATH_SAMPLE_LIMIT {
+            let remaining = PATH_SAMPLE_LIMIT - self.node_path_samples.len();
+            self.node_path_samples
+                .extend(other.node_path_samples.iter().take(remaining).cloned());
+        }
+        if self.root_path_samples.len() < PATH_SAMPLE_LIMIT {
+            let remaining = PATH_SAMPLE_LIMIT - self.root_path_samples.len();
+            self.root_path_samples
+                .extend(other.root_path_samples.iter().take(remaining).cloned());
+        }
     }
 }
 

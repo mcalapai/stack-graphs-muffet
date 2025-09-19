@@ -35,7 +35,8 @@ use super::encoding::{decode_partial_path, encode_partial_path};
 use super::{
     Database, FileEntry, FileStatus, Stats, StorageComponents, StorageError, StorageFileListing,
     StorageReader, StorageWriter, SymbolStackExactVariant, SymbolStackQuery,
-    SymbolStackQueryHandle, SymbolStackQueryKey, SymbolStackQueryPool, BINCODE_CONFIG, VERSION,
+    SymbolStackQueryHandle, SymbolStackQueryKey, SymbolStackQueryPool, WriteStats, BINCODE_CONFIG,
+    VERSION,
 };
 
 const METADATA_TABLE: TableDefinition<'static, &str, u64> = TableDefinition::new("metadata");
@@ -632,6 +633,7 @@ pub struct RedbWriter {
     db: RedbDatabase,
     graph_buf: Vec<u8>,
     path_buf: Vec<u8>,
+    stats: WriteStats,
 }
 
 impl RedbWriter {
@@ -642,6 +644,7 @@ impl RedbWriter {
             db,
             graph_buf: Vec::new(),
             path_buf: Vec::new(),
+            stats: WriteStats::default(),
         })
     }
 
@@ -663,6 +666,7 @@ impl RedbWriter {
             db,
             graph_buf: Vec::new(),
             path_buf: Vec::new(),
+            stats: WriteStats::default(),
         })
     }
 
@@ -700,6 +704,8 @@ impl RedbWriter {
                 .map_err(RedbError::from)?;
             let encoded = GraphRecord::encode(tag, Some(error), serialized);
             graphs.insert(file_name.as_str(), encoded.as_slice())?;
+            self.stats
+                .record_graph_write(file_name.as_str(), tag, encoded.as_slice());
         }
         txn.commit()?;
         Ok(())
@@ -727,6 +733,8 @@ impl RedbWriter {
                 .map_err(RedbError::from)?;
             let encoded = GraphRecord::encode(tag, None, serialized);
             graphs.insert(file_name.as_str(), encoded.as_slice())?;
+            self.stats
+                .record_graph_write(file_name.as_str(), tag, encoded.as_slice());
         }
         {
             let mut node_table = txn.open_table(FILE_PATHS_TABLE)?;
@@ -742,9 +750,19 @@ impl RedbWriter {
                     let key = encode_root_key(file_name.as_str(), &symbol_stack);
                     root_by_file.insert(key.as_slice(), serialized)?;
                     root_by_symbol.insert(symbol_stack.as_str(), file_name.as_str())?;
+                    self.stats.record_root_path_write(
+                        file_name.as_str(),
+                        &symbol_stack,
+                        serialized,
+                    );
                 } else if start_node.is_in_file(file) {
                     let key = encode_node_key(file_name.as_str(), start_node.local_id());
                     node_table.insert(key.as_slice(), serialized)?;
+                    self.stats.record_node_path_write(
+                        file_name.as_str(),
+                        start_node.local_id(),
+                        serialized,
+                    );
                 } else {
                     panic!(
                         "added path {} must start in given file {} or at root",
@@ -956,6 +974,10 @@ impl StorageWriter for RedbWriter {
 
     fn into_reader(self) -> std::result::Result<Self::Reader, Self::Error> {
         RedbWriter::into_reader(self)
+    }
+
+    fn stats(&self) -> WriteStats {
+        self.stats.clone()
     }
 }
 
