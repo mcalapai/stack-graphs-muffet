@@ -15,6 +15,7 @@ use rusqlite::OptionalExtension;
 use rusqlite::Params;
 use rusqlite::Statement;
 use std::collections::HashSet;
+use std::fmt;
 use std::path::Path;
 use std::path::PathBuf;
 use thiserror::Error;
@@ -701,6 +702,7 @@ impl SQLiteReader {
                 continue;
             }
             self.stats.root_path_loads += 1;
+            self.stats.record_root_path_load(&query);
             match &query {
                 SymbolStackQuery::Exact(key) => {
                     copious_debugging!(" * Load extensions from root with symbol stack = {}", key);
@@ -810,6 +812,17 @@ enum SymbolStackQuery {
     Range { start: String, end: String },
 }
 
+impl fmt::Display for SymbolStackQuery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SymbolStackQuery::Exact(key) => write!(f, "Exact({key})"),
+            SymbolStackQuery::Range { start, end } => {
+                write!(f, "Range({start}..{end})")
+            }
+        }
+    }
+}
+
 fn prefix_upper_bound(prefix: &str) -> String {
     let mut bound = prefix.to_owned();
     bound.push(char::MAX);
@@ -910,6 +923,9 @@ pub struct Stats {
     pub file_cached: usize,
     pub root_path_loads: usize,
     pub root_path_cached: usize,
+    pub root_path_loads_exact: usize,
+    pub root_path_loads_range: usize,
+    pub root_path_load_samples: Vec<String>,
     pub node_path_loads: usize,
     pub node_path_cached: usize,
 }
@@ -924,6 +940,17 @@ impl Stats {
             file_loads: self.file_loads,
             file_cached: self.file_cached,
             ..Stats::default()
+        }
+    }
+
+    fn record_root_path_load(&mut self, query: &SymbolStackQuery) {
+        match query {
+            SymbolStackQuery::Exact(_) => self.root_path_loads_exact += 1,
+            SymbolStackQuery::Range { .. } => self.root_path_loads_range += 1,
+        }
+        const SAMPLE_LIMIT: usize = 64;
+        if self.root_path_load_samples.len() < SAMPLE_LIMIT {
+            self.root_path_load_samples.push(query.to_string());
         }
     }
 }
