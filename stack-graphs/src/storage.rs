@@ -6,6 +6,10 @@
 // ------------------------------------------------------------------------------------------------
 
 mod encoding;
+#[cfg(feature = "storage-redb")]
+pub mod redb;
+#[cfg(feature = "storage-redb")]
+pub use redb::{RedbError, RedbReader, RedbWriter};
 
 use bincode::error::DecodeError;
 use bincode::error::EncodeError;
@@ -45,7 +49,7 @@ use smallvec::SmallVec;
 
 use self::encoding::{decode_partial_path, encode_partial_path};
 
-const VERSION: usize = 7;
+pub(crate) const VERSION: usize = 7;
 
 const SCHEMA: &str = r#"
         CREATE TABLE metadata (
@@ -188,9 +192,10 @@ pub struct Files<'a, P: Params>(Statement<'a>, P);
 
 impl<'a, P: Params + Clone> Files<'a, P> {
     pub fn try_iter(&mut self) -> Result<SqliteFileEntries<'_>> {
-        let rows = self
-            .0
-            .query_map(self.1.clone(), row_to_file_entry as fn(&Row<'_>) -> rusqlite::Result<FileEntry>)?;
+        let rows = self.0.query_map(
+            self.1.clone(),
+            row_to_file_entry as fn(&Row<'_>) -> rusqlite::Result<FileEntry>,
+        )?;
         Ok(SqliteFileEntries { rows })
     }
 }
@@ -1195,7 +1200,7 @@ impl StorageReader for SQLiteReader {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum SymbolStackExactVariant {
+pub(crate) enum SymbolStackExactVariant {
     /// Matches a `V`-prefixed storage key for an exact symbol stack prefix.
     VariablePrefix,
     /// Matches an `X`-prefixed storage key for a full stack without variables.
@@ -1203,7 +1208,7 @@ enum SymbolStackExactVariant {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum SymbolStackRangeVariant {
+pub(crate) enum SymbolStackRangeVariant {
     /// Matches a `V`-prefixed range query (variable-aware prefix).
     VariablePrefix,
     /// Matches an `X`-prefixed range query (non-variable prefix).
@@ -1211,7 +1216,7 @@ enum SymbolStackRangeVariant {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum SymbolStackQueryKey {
+pub(crate) enum SymbolStackQueryKey {
     Exact {
         variant: SymbolStackExactVariant,
         symbols: SmallVec<[Handle<Symbol>; 8]>,
@@ -1223,7 +1228,7 @@ enum SymbolStackQueryKey {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct SymbolStackQueryHandle(u32);
+pub(crate) struct SymbolStackQueryHandle(u32);
 
 impl SymbolStackQueryHandle {
     fn index(self) -> usize {
@@ -1237,17 +1242,17 @@ struct SymbolStackQueryEntry {
 }
 
 #[derive(Default)]
-struct SymbolStackQueryPool {
+pub(crate) struct SymbolStackQueryPool {
     entries: Vec<SymbolStackQueryEntry>,
     map: HashMap<SymbolStackQueryKey, SymbolStackQueryHandle>,
 }
 
 impl SymbolStackQueryPool {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.entries.clear();
         self.map.clear();
     }
@@ -1269,17 +1274,17 @@ impl SymbolStackQueryPool {
         handle
     }
 
-    fn get(&self, handle: SymbolStackQueryHandle) -> &SymbolStackQuery {
+    pub(crate) fn get(&self, handle: SymbolStackQueryHandle) -> &SymbolStackQuery {
         &self.entries[handle.index()].query
     }
 
-    fn get_key(&self, handle: SymbolStackQueryHandle) -> &SymbolStackQueryKey {
+    pub(crate) fn get_key(&self, handle: SymbolStackQueryHandle) -> &SymbolStackQueryKey {
         &self.entries[handle.index()].key
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum SymbolStackQuery {
+pub(crate) enum SymbolStackQuery {
     Exact(String),
     Range { start: String, end: String },
 }
@@ -1295,7 +1300,7 @@ impl fmt::Display for SymbolStackQuery {
     }
 }
 
-fn prefix_upper_bound(prefix: &str) -> String {
+pub(crate) fn prefix_upper_bound(prefix: &str) -> String {
     let mut bound = prefix.to_owned();
     bound.push(char::MAX);
     bound

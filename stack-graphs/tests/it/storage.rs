@@ -8,10 +8,16 @@
 use itertools::Itertools;
 use stack_graphs::graph::StackGraph;
 use stack_graphs::partial::PartialPaths;
+#[cfg(feature = "storage-redb")]
+use stack_graphs::storage::redb::convert_sqlite_to_redb;
 use stack_graphs::storage::{
-    SQLiteReader, SQLiteWriter, StorageError, StorageReader, StorageWriter,
+    FileStatus, SQLiteReader, SQLiteWriter, StorageError, StorageReader, StorageWriter,
 };
+#[cfg(feature = "storage-redb")]
+use stack_graphs::storage::{RedbError, RedbReader, RedbWriter};
 use stack_graphs::NoCancellation;
+#[cfg(feature = "storage-redb")]
+use tempfile::TempDir;
 
 use crate::util::create_partial_path_and_edges;
 use crate::util::create_pop_symbol_node;
@@ -55,12 +61,88 @@ impl StorageTestBackend for SqliteBackend {
     }
 }
 
+#[cfg(feature = "storage-redb")]
+struct RedbBackend;
+
+#[cfg(feature = "storage-redb")]
+impl StorageTestBackend for RedbBackend {
+    type Error = RedbError;
+    type Writer = RedbWriter;
+    type Reader = RedbReader;
+
+    fn name() -> &'static str {
+        "redb"
+    }
+
+    fn create_writer() -> Result<Self::Writer, Self::Error> {
+        RedbWriter::open_in_memory()
+    }
+
+    fn into_reader(writer: Self::Writer) -> Result<Self::Reader, Self::Error> {
+        StorageWriter::into_reader(writer)
+    }
+}
+
+#[cfg(feature = "storage-redb")]
+#[test]
+fn converts_sqlite_database_to_redb() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
+    let sqlite_path = temp.path().join("store.sqlite");
+    let redb_path = temp.path().join("store.redb");
+
+    let mut sqlite_writer = SQLiteWriter::open(&sqlite_path)?;
+    let mut graph = StackGraph::new();
+    let file = graph.add_file("test1").unwrap();
+    let mut partials = PartialPaths::new();
+    let r = StackGraph::root_node();
+    let foo = create_pop_symbol_node(&mut graph, file, "foo", true);
+    let path = create_partial_path_and_edges(&mut graph, &mut partials, &[r, foo]).unwrap();
+    StorageWriter::store_result_for_file(
+        &mut sqlite_writer,
+        &graph,
+        file,
+        "tag",
+        &mut partials,
+        vec![&path],
+    )?;
+    drop(sqlite_writer);
+
+    convert_sqlite_to_redb(&sqlite_path, &redb_path)?;
+
+    let mut reader = RedbReader::open(&redb_path)?;
+    assert!(matches!(
+        StorageReader::status_for_file(&mut reader, "test1", Some("tag"))?,
+        FileStatus::Indexed
+    ));
+
+    reader.load_graph_for_file("test1")?;
+    let query_path = {
+        let (graph, partials, _) = reader.components_mut();
+        let file = graph.add_file("query").unwrap();
+        let r = StackGraph::root_node();
+        let foo_ref = create_push_symbol_node(graph, file, "foo", true);
+        create_partial_path_and_edges(graph, partials, &[foo_ref, r]).unwrap()
+    };
+    reader.load_partial_path_extensions(&query_path, &NoCancellation)?;
+    let (graph, partials, db) = reader.components_mut();
+    let mut results = Vec::new();
+    db.find_candidate_partial_paths_from_root(
+        &*graph,
+        partials,
+        Some(query_path.symbol_stack_postcondition),
+        &mut results,
+    );
+    assert!(!results.is_empty());
+
+    Ok(())
+}
+
 macro_rules! run_for_backends {
     ($test_fn:ident) => {{
         $test_fn::<SqliteBackend>();
         #[cfg(feature = "storage-redb")]
         {
-            // Additional backends will be added when storage-redb is implemented.
+            $test_fn::<RedbBackend>();
         }
     }};
 }
