@@ -5,6 +5,8 @@
 // Please see the LICENSE-APACHE or LICENSE-MIT files in this distribution for license details.
 // ------------------------------------------------------------------------------------------------
 
+mod encoding;
+
 use bincode::error::DecodeError;
 use bincode::error::EncodeError;
 use itertools::Itertools;
@@ -36,7 +38,9 @@ use crate::stitching::ForwardCandidates;
 use crate::CancellationError;
 use crate::CancellationFlag;
 
-const VERSION: usize = 6;
+use self::encoding::{decode_partial_path, encode_partial_path};
+
+const VERSION: usize = 7;
 
 const SCHEMA: &str = r#"
         CREATE TABLE metadata (
@@ -92,6 +96,8 @@ pub enum StorageError {
     SerializeFail(#[from] EncodeError),
     #[error(transparent)]
     DeserializeFail(#[from] DecodeError),
+    #[error("corrupt storage data: {0}")]
+    Corrupt(String),
 }
 
 pub type Result<T> = std::result::Result<T, StorageError>;
@@ -382,8 +388,8 @@ impl SQLiteWriter {
             );
             let start_node = graph[path.start_node].id();
 
-            let path_ser = serde::PartialPath::from_partial_path(graph, partials, path);
-            let serialized = encode_into_buf(&path_ser, buf)?;
+            encode_partial_path(graph, partials, path, buf)?;
+            let serialized = buf.as_slice();
 
             if start_node.is_root() {
                 copious_debugging!(
@@ -632,9 +638,7 @@ impl SQLiteReader {
             let slice = row.get_ref(1)?.as_blob().map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(1, Type::Blob, Box::new(e))
             })?;
-            let (path_ser, _): (crate::serde::PartialPath, usize) =
-                bincode::borrow_decode_from_slice(slice, BINCODE_CONFIG)?;
-            let path = path_ser.to_partial_path(&mut self.graph, &mut self.partials)?;
+            let path = decode_partial_path(slice, &mut self.graph, &mut self.partials)?;
             copious_debugging!(
                 "   > Prefetched {}",
                 path.display(&self.graph, &mut self.partials)
@@ -682,9 +686,7 @@ impl SQLiteReader {
             let slice = row.get_ref(1)?.as_blob().map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(1, Type::Blob, Box::new(e))
             })?;
-            let (path_ser, _): (crate::serde::PartialPath, usize) =
-                bincode::borrow_decode_from_slice(slice, BINCODE_CONFIG)?;
-            let path = path_ser.to_partial_path(&mut self.graph, &mut self.partials)?;
+            let path = decode_partial_path(slice, &mut self.graph, &mut self.partials)?;
             copious_debugging!(
                 "   > Prefetched root {}",
                 path.display(&self.graph, &mut self.partials)
@@ -806,9 +808,7 @@ impl SQLiteReader {
                         let slice = row.get_ref(1)?.as_blob().map_err(|e| {
                             rusqlite::Error::FromSqlConversionFailure(1, Type::Blob, Box::new(e))
                         })?;
-                        let (path_ser, _): (crate::serde::PartialPath, usize) =
-                            bincode::borrow_decode_from_slice(slice, BINCODE_CONFIG)?;
-                        let path = path_ser.to_partial_path(&mut self.graph, &mut self.partials)?;
+                        let path = decode_partial_path(slice, &mut self.graph, &mut self.partials)?;
                         copious_debugging!(
                             "   > Loaded {}",
                             path.display(&self.graph, &mut self.partials)
