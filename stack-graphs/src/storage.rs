@@ -448,11 +448,11 @@ impl SQLiteWriter {
 /// Reader to load stack graphs and partial paths from a SQLite database.
 pub struct SQLiteReader {
     conn: Connection,
-    loaded_graphs: HashSet<String>,
+    loaded_graphs: HashSet<Handle<File>>,
     loaded_node_paths: HashSet<Handle<Node>>,
     loaded_root_paths: HashSet<SymbolStackQuery>,
     node_paths_prefetched: HashSet<Handle<File>>,
-    root_paths_prefetched: HashSet<String>,
+    root_paths_prefetched: HashSet<Handle<File>>,
     graph: StackGraph,
     partials: PartialPaths,
     db: Database,
@@ -566,15 +566,17 @@ impl SQLiteReader {
     fn load_graph_for_file_inner(
         file: &str,
         graph: &mut StackGraph,
-        loaded_graphs: &mut HashSet<String>,
+        loaded_graphs: &mut HashSet<Handle<File>>,
         conn: &Connection,
         stats: &mut Stats,
     ) -> Result<Handle<File>> {
         copious_debugging!("--> Load graph for {}", file);
-        if !loaded_graphs.insert(file.to_string()) {
-            copious_debugging!(" * Already loaded");
-            stats.file_cached += 1;
-            return Ok(graph.get_file(file).expect("loaded file to exist"));
+        if let Some(handle) = graph.get_file(file) {
+            if loaded_graphs.contains(&handle) {
+                copious_debugging!(" * Already loaded");
+                stats.file_cached += 1;
+                return Ok(handle);
+            }
         }
         copious_debugging!(" * Load from database");
         stats.file_loads += 1;
@@ -593,7 +595,9 @@ impl SQLiteReader {
             return Err(rusqlite::Error::QueryReturnedNoRows.into());
         }
 
-        Ok(graph.get_file(file).expect("loaded file to exist"))
+        let handle = graph.get_file(file).expect("loaded file to exist");
+        loaded_graphs.insert(handle);
+        Ok(handle)
     }
 
     pub fn load_graphs_for_file_or_directory(
@@ -669,7 +673,11 @@ impl SQLiteReader {
         file: &str,
         cancellation_flag: &dyn CancellationFlag,
     ) -> Result<()> {
-        if !self.root_paths_prefetched.insert(file.to_owned()) {
+        let file_handle = self
+            .graph
+            .get_file(file)
+            .expect("file graph must be loaded before prefetching root paths");
+        if !self.root_paths_prefetched.insert(file_handle) {
             return Ok(());
         }
 
