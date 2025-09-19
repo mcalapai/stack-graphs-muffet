@@ -5,6 +5,8 @@
 // Please see the LICENSE-APACHE or LICENSE-MIT files in this distribution for license details.
 // ------------------------------------------------------------------------------------------------
 
+mod encoding;
+
 use bincode::error::DecodeError;
 use bincode::error::EncodeError;
 use itertools::Itertools;
@@ -14,7 +16,8 @@ use rusqlite::Connection;
 use rusqlite::OptionalExtension;
 use rusqlite::Params;
 use rusqlite::Statement;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::path::Path;
 use std::path::PathBuf;
 use thiserror::Error;
@@ -23,7 +26,9 @@ use crate::arena::Handle;
 use crate::graph::Degree;
 use crate::graph::File;
 use crate::graph::Node;
+use crate::graph::NodeID;
 use crate::graph::StackGraph;
+use crate::graph::Symbol;
 use crate::partial::PartialPath;
 use crate::partial::PartialPaths;
 use crate::partial::PartialSymbolStack;
@@ -34,7 +39,11 @@ use crate::stitching::ForwardCandidates;
 use crate::CancellationError;
 use crate::CancellationFlag;
 
-const VERSION: usize = 6;
+use smallvec::SmallVec;
+
+use self::encoding::{decode_partial_path, encode_partial_path};
+
+const VERSION: usize = 7;
 
 const SCHEMA: &str = r#"
         CREATE TABLE metadata (
@@ -90,6 +99,8 @@ pub enum StorageError {
     SerializeFail(#[from] EncodeError),
     #[error(transparent)]
     DeserializeFail(#[from] DecodeError),
+    #[error("corrupt storage data: {0}")]
+    Corrupt(String),
 }
 
 pub type Result<T> = std::result::Result<T, StorageError>;
@@ -380,8 +391,8 @@ impl SQLiteWriter {
             );
             let start_node = graph[path.start_node].id();
 
-            let path_ser = serde::PartialPath::from_partial_path(graph, partials, path);
-            let serialized = encode_into_buf(&path_ser, buf)?;
+            encode_partial_path(graph, partials, path, buf)?;
+            let serialized = buf.as_slice();
 
             if start_node.is_root() {
                 copious_debugging!(
@@ -427,10 +438,13 @@ impl SQLiteWriter {
             loaded_graphs: HashSet::new(),
             loaded_node_paths: HashSet::new(),
             loaded_root_paths: HashSet::new(),
+            node_paths_prefetched: HashSet::new(),
+            root_paths_prefetched: HashSet::new(),
             graph: StackGraph::new(),
             partials: PartialPaths::new(),
             db: Database::new(),
             stats: Stats::default(),
+            symbol_stack_queries: SymbolStackQueryPool::new(),
         }
     }
 }
@@ -438,13 +452,16 @@ impl SQLiteWriter {
 /// Reader to load stack graphs and partial paths from a SQLite database.
 pub struct SQLiteReader {
     conn: Connection,
-    loaded_graphs: HashSet<String>,
+    loaded_graphs: HashSet<Handle<File>>,
     loaded_node_paths: HashSet<Handle<Node>>,
-    loaded_root_paths: HashSet<String>,
+    loaded_root_paths: HashSet<SymbolStackQueryHandle>,
+    node_paths_prefetched: HashSet<Handle<File>>,
+    root_paths_prefetched: HashSet<Handle<File>>,
     graph: StackGraph,
     partials: PartialPaths,
     db: Database,
     stats: Stats,
+    symbol_stack_queries: SymbolStackQueryPool,
 }
 
 impl SQLiteReader {
@@ -464,10 +481,13 @@ impl SQLiteReader {
             loaded_graphs: HashSet::new(),
             loaded_node_paths: HashSet::new(),
             loaded_root_paths: HashSet::new(),
+            node_paths_prefetched: HashSet::new(),
+            root_paths_prefetched: HashSet::new(),
             graph: StackGraph::new(),
             partials: PartialPaths::new(),
             db: Database::new(),
             stats: Stats::default(),
+            symbol_stack_queries: SymbolStackQueryPool::new(),
         })
     }
 
@@ -479,10 +499,13 @@ impl SQLiteReader {
 
         self.loaded_node_paths.clear();
         self.loaded_root_paths.clear();
+        self.node_paths_prefetched.clear();
+        self.root_paths_prefetched.clear();
         self.partials.clear();
         self.db.clear();
 
         self.stats.clear();
+        self.symbol_stack_queries.clear();
     }
 
     /// Clear path data that has been loaded into this reader instance.
@@ -491,10 +514,13 @@ impl SQLiteReader {
     pub fn clear_paths(&mut self) {
         self.loaded_node_paths.clear();
         self.loaded_root_paths.clear();
+        self.node_paths_prefetched.clear();
+        self.root_paths_prefetched.clear();
         self.partials.clear();
         self.db.clear();
 
         self.stats.clear_paths();
+        self.symbol_stack_queries.clear();
     }
 
     /// Get the file's status in the database. If a tag is provided, it must match or the file
@@ -548,15 +574,17 @@ impl SQLiteReader {
     fn load_graph_for_file_inner(
         file: &str,
         graph: &mut StackGraph,
-        loaded_graphs: &mut HashSet<String>,
+        loaded_graphs: &mut HashSet<Handle<File>>,
         conn: &Connection,
         stats: &mut Stats,
     ) -> Result<Handle<File>> {
         copious_debugging!("--> Load graph for {}", file);
-        if !loaded_graphs.insert(file.to_string()) {
-            copious_debugging!(" * Already loaded");
-            stats.file_cached += 1;
-            return Ok(graph.get_file(file).expect("loaded file to exist"));
+        if let Some(handle) = graph.get_file(file) {
+            if loaded_graphs.contains(&handle) {
+                copious_debugging!(" * Already loaded");
+                stats.file_cached += 1;
+                return Ok(handle);
+            }
         }
         copious_debugging!(" * Load from database");
         stats.file_loads += 1;
@@ -575,7 +603,9 @@ impl SQLiteReader {
             return Err(rusqlite::Error::QueryReturnedNoRows.into());
         }
 
-        Ok(graph.get_file(file).expect("loaded file to exist"))
+        let handle = graph.get_file(file).expect("loaded file to exist");
+        loaded_graphs.insert(handle);
+        Ok(handle)
     }
 
     pub fn load_graphs_for_file_or_directory(
@@ -597,6 +627,132 @@ impl SQLiteReader {
         Ok(())
     }
 
+    fn preload_node_paths_for_file(
+        &mut self,
+        file: Handle<File>,
+        cancellation_flag: &dyn CancellationFlag,
+    ) -> Result<()> {
+        if !self.node_paths_prefetched.insert(file) {
+            return Ok(());
+        }
+
+        let file_name = self.graph[file].name().to_string();
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT local_id, value FROM file_paths WHERE file = ?")?;
+        let mut rows = stmt.query([file_name.as_str()])?;
+
+        #[cfg_attr(not(feature = "copious-debugging"), allow(unused))]
+        let mut count = 0usize;
+        while let Some(row) = rows.next()? {
+            cancellation_flag.check("loading node paths")?;
+            let local_id: u32 = row.get(0)?;
+            let slice = row.get_ref(1)?.as_blob().map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(1, Type::Blob, Box::new(e))
+            })?;
+            let path = decode_partial_path(slice, &mut self.graph, &mut self.partials)?;
+            copious_debugging!(
+                "   > Prefetched {}",
+                path.display(&self.graph, &mut self.partials)
+            );
+            self.db
+                .add_partial_path(&self.graph, &mut self.partials, path);
+
+            if let Some(handle) = self.graph.node_for_id(NodeID::new_in_file(file, local_id)) {
+                self.loaded_node_paths.insert(handle);
+            }
+            count += 1;
+        }
+        copious_debugging!(
+            "   > Prefetched {} node paths for {}",
+            count,
+            file.display(&self.graph)
+        );
+
+        for node in self.graph.nodes_for_file(file) {
+            self.loaded_node_paths.insert(node);
+        }
+
+        Ok(())
+    }
+
+    fn preload_root_paths_for_file(
+        &mut self,
+        file: &str,
+        cancellation_flag: &dyn CancellationFlag,
+    ) -> Result<()> {
+        let file_handle = self
+            .graph
+            .get_file(file)
+            .expect("file graph must be loaded before prefetching root paths");
+        if !self.root_paths_prefetched.insert(file_handle) {
+            return Ok(());
+        }
+
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT symbol_stack, value FROM root_paths WHERE file = ?")?;
+        let mut rows = stmt.query([file])?;
+
+        #[cfg_attr(not(feature = "copious-debugging"), allow(unused))]
+        let mut count = 0usize;
+        while let Some(row) = rows.next()? {
+            cancellation_flag.check("loading root paths")?;
+            let _symbol_stack: String = row.get(0)?;
+            let slice = row.get_ref(1)?.as_blob().map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(1, Type::Blob, Box::new(e))
+            })?;
+            let path = decode_partial_path(slice, &mut self.graph, &mut self.partials)?;
+            copious_debugging!(
+                "   > Prefetched root {}",
+                path.display(&self.graph, &mut self.partials)
+            );
+            let symbol_stack_precondition = path.symbol_stack_precondition;
+            self.db
+                .add_partial_path(&self.graph, &mut self.partials, path);
+
+            let handles = symbol_stack_precondition.storage_key_queries(
+                &self.graph,
+                &mut self.partials,
+                &mut self.symbol_stack_queries,
+            );
+            for handle in handles {
+                if matches!(
+                    self.symbol_stack_queries.get_key(handle),
+                    SymbolStackQueryKey::Exact {
+                        variant: SymbolStackExactVariant::FullStack,
+                        ..
+                    }
+                ) {
+                    self.loaded_root_paths.insert(handle);
+                }
+            }
+            count += 1;
+        }
+        copious_debugging!("   > Prefetched {count} root paths for {file}");
+
+        Ok(())
+    }
+
+    fn files_with_exact_root_symbol_stack(
+        &self,
+        key: &str,
+        cancellation_flag: &dyn CancellationFlag,
+    ) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT file FROM root_paths WHERE symbol_stack = ?")?;
+        let mut rows = stmt.query([key])?;
+        let mut files = Vec::new();
+        while let Some(row) = rows.next()? {
+            cancellation_flag.check("loading root paths")?;
+            files.push(row.get::<_, String>(0)?);
+        }
+        files.sort();
+        files.dedup();
+        Ok(files)
+    }
+
     /// Ensure the paths starting at the given node are loaded.
     fn load_paths_for_node(
         &mut self,
@@ -612,32 +768,11 @@ impl SQLiteReader {
         self.stats.node_path_loads += 1;
         let id = self.graph[node].id();
         let file = id.file().expect("file node required");
-        let file = self.graph[file].name();
-
-        let mut stmt = self
-            .conn
-            .prepare_cached("SELECT value FROM file_paths WHERE file = ? AND local_id = ?")?;
-        let mut rows = stmt.query((file, id.local_id()))?;
-
-        #[cfg_attr(not(feature = "copious-debugging"), allow(unused))]
-        let mut count = 0usize;
-        while let Some(row) = rows.next()? {
-            cancellation_flag.check("loading node paths")?;
-            let slice = row.get_ref(0)?.as_blob().map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(0, Type::Blob, Box::new(e))
-            })?;
-            let (path_ser, _): (crate::serde::PartialPath, usize) =
-                bincode::borrow_decode_from_slice(slice, BINCODE_CONFIG)?;
-            let path = path_ser.to_partial_path(&mut self.graph, &mut self.partials)?;
-            copious_debugging!(
-                "   > Loaded {}",
-                path.display(&self.graph, &mut self.partials)
-            );
-            self.db
-                .add_partial_path(&self.graph, &mut self.partials, path);
-            count += 1;
-        }
-        copious_debugging!("   > Loaded {}", count);
+        self.preload_node_paths_for_file(file, cancellation_flag)?;
+        copious_debugging!(
+            "   > Node paths available for {}",
+            file.display(&self.graph)
+        );
         Ok(())
     }
 
@@ -651,53 +786,76 @@ impl SQLiteReader {
             " * Load extensions from root with symbol stack {}",
             symbol_stack.display(&self.graph, &mut self.partials)
         );
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT file,value FROM root_paths WHERE symbol_stack LIKE ? ESCAPE ?",
-        )?;
-        let (symbol_stack_patterns, escape) =
-            symbol_stack.storage_key_patterns(&self.graph, &mut self.partials);
-        for symbol_stack in symbol_stack_patterns {
-            copious_debugging!(
-                " * Load extensions from root with prefix symbol stack {}",
-                symbol_stack
-            );
-            if !self.loaded_root_paths.insert(symbol_stack.clone()) {
+        let query_handles = symbol_stack.storage_key_queries(
+            &self.graph,
+            &mut self.partials,
+            &mut self.symbol_stack_queries,
+        );
+        for handle in query_handles {
+            if !self.loaded_root_paths.insert(handle) {
                 copious_debugging!("   > Already loaded");
                 self.stats.root_path_cached += 1;
                 continue;
             }
             self.stats.root_path_loads += 1;
-
-            let mut rows = stmt.query([symbol_stack, escape.clone()])?;
-            #[cfg_attr(not(feature = "copious-debugging"), allow(unused))]
-            let mut count = 0usize;
-            while let Some(row) = rows.next()? {
-                cancellation_flag.check("loading root paths")?;
-                let file: String = row.get(0)?;
-                // Ensure graph for 'file' is present
-                Self::load_graph_for_file_inner(
-                    &file,
-                    &mut self.graph,
-                    &mut self.loaded_graphs,
-                    &self.conn,
-                    &mut self.stats,
-                )?;
-
-                let slice = row.get_ref(1)?.as_blob().map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(1, Type::Blob, Box::new(e))
-                })?;
-                let (path_ser, _): (crate::serde::PartialPath, usize) =
-                    bincode::borrow_decode_from_slice(slice, BINCODE_CONFIG)?;
-                let path = path_ser.to_partial_path(&mut self.graph, &mut self.partials)?;
-                copious_debugging!(
-                    "   > Loaded {}",
-                    path.display(&self.graph, &mut self.partials)
-                );
-                self.db
-                    .add_partial_path(&self.graph, &mut self.partials, path);
-                count += 1;
+            let query = self.symbol_stack_queries.get(handle);
+            self.stats.record_root_path_load(query);
+            match query {
+                SymbolStackQuery::Exact(key) => {
+                    copious_debugging!(" * Load extensions from root with symbol stack = {}", key);
+                    let files =
+                        self.files_with_exact_root_symbol_stack(key.as_str(), cancellation_flag)?;
+                    let mut count = 0usize;
+                    for file in files {
+                        cancellation_flag.check("loading root paths")?;
+                        Self::load_graph_for_file_inner(
+                            &file,
+                            &mut self.graph,
+                            &mut self.loaded_graphs,
+                            &self.conn,
+                            &mut self.stats,
+                        )?;
+                        self.preload_root_paths_for_file(&file, cancellation_flag)?;
+                        count += 1;
+                    }
+                    copious_debugging!("   > Prefetched {} files", count);
+                }
+                SymbolStackQuery::Range { start, end } => {
+                    copious_debugging!(
+                        " * Load extensions from root with symbol stack prefix {}",
+                        start
+                    );
+                    let mut range_stmt = self.conn.prepare_cached(
+                        "SELECT file,value FROM root_paths WHERE symbol_stack >= ? AND symbol_stack < ?",
+                    )?;
+                    let mut rows = range_stmt.query((start.as_str(), end.as_str()))?;
+                    #[cfg_attr(not(feature = "copious-debugging"), allow(unused))]
+                    let mut count = 0usize;
+                    while let Some(row) = rows.next()? {
+                        cancellation_flag.check("loading root paths")?;
+                        let file: String = row.get(0)?;
+                        Self::load_graph_for_file_inner(
+                            &file,
+                            &mut self.graph,
+                            &mut self.loaded_graphs,
+                            &self.conn,
+                            &mut self.stats,
+                        )?;
+                        let slice = row.get_ref(1)?.as_blob().map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(1, Type::Blob, Box::new(e))
+                        })?;
+                        let path = decode_partial_path(slice, &mut self.graph, &mut self.partials)?;
+                        copious_debugging!(
+                            "   > Loaded {}",
+                            path.display(&self.graph, &mut self.partials)
+                        );
+                        self.db
+                            .add_partial_path(&self.graph, &mut self.partials, path);
+                        count += 1;
+                    }
+                    copious_debugging!("   > Loaded {} records", count);
+                }
             }
-            copious_debugging!("   > Loaded {}", count);
         }
         Ok(())
     }
@@ -732,6 +890,113 @@ impl SQLiteReader {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum SymbolStackExactVariant {
+    /// Matches a `V`-prefixed storage key for an exact symbol stack prefix.
+    VariablePrefix,
+    /// Matches an `X`-prefixed storage key for a full stack without variables.
+    FullStack,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum SymbolStackRangeVariant {
+    /// Matches a `V`-prefixed range query (variable-aware prefix).
+    VariablePrefix,
+    /// Matches an `X`-prefixed range query (non-variable prefix).
+    NonVariablePrefix,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum SymbolStackQueryKey {
+    Exact {
+        variant: SymbolStackExactVariant,
+        symbols: SmallVec<[Handle<Symbol>; 8]>,
+    },
+    Range {
+        variant: SymbolStackRangeVariant,
+        symbols: SmallVec<[Handle<Symbol>; 8]>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct SymbolStackQueryHandle(u32);
+
+impl SymbolStackQueryHandle {
+    fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+struct SymbolStackQueryEntry {
+    key: SymbolStackQueryKey,
+    query: SymbolStackQuery,
+}
+
+#[derive(Default)]
+struct SymbolStackQueryPool {
+    entries: Vec<SymbolStackQueryEntry>,
+    map: HashMap<SymbolStackQueryKey, SymbolStackQueryHandle>,
+}
+
+impl SymbolStackQueryPool {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.map.clear();
+    }
+
+    fn intern_with<F>(&mut self, key: SymbolStackQueryKey, build: F) -> SymbolStackQueryHandle
+    where
+        F: FnOnce() -> SymbolStackQuery,
+    {
+        if let Some(handle) = self.map.get(&key) {
+            return *handle;
+        }
+        let handle = SymbolStackQueryHandle(self.entries.len() as u32);
+        let query = build();
+        self.entries.push(SymbolStackQueryEntry {
+            key: key.clone(),
+            query,
+        });
+        self.map.insert(key, handle);
+        handle
+    }
+
+    fn get(&self, handle: SymbolStackQueryHandle) -> &SymbolStackQuery {
+        &self.entries[handle.index()].query
+    }
+
+    fn get_key(&self, handle: SymbolStackQueryHandle) -> &SymbolStackQueryKey {
+        &self.entries[handle.index()].key
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum SymbolStackQuery {
+    Exact(String),
+    Range { start: String, end: String },
+}
+
+impl fmt::Display for SymbolStackQuery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SymbolStackQuery::Exact(key) => write!(f, "Exact({key})"),
+            SymbolStackQuery::Range { start, end } => {
+                write!(f, "Range({start}..{end})")
+            }
+        }
+    }
+}
+
+fn prefix_upper_bound(prefix: &str) -> String {
+    let mut bound = prefix.to_owned();
+    bound.push(char::MAX);
+    bound
+}
+
 // Methods for computing keys and patterns for a symbol stack. The format of a storage key is:
 //
 //     has-var GS ( symbol (US symbol)* )?
@@ -752,34 +1017,79 @@ impl PartialSymbolStack {
         key
     }
 
-    /// Returns string representations for all prefixes of this symbol stack for querying the
-    /// index in the database.
-    fn storage_key_patterns(
+    /// Returns queries for matching this symbol stack when searching in the database.
+    fn storage_key_queries(
         mut self,
         graph: &StackGraph,
         partials: &mut PartialPaths,
-    ) -> (Vec<String>, String) {
-        let mut key_patterns = Vec::new();
+        pool: &mut SymbolStackQueryPool,
+    ) -> Vec<SymbolStackQueryHandle> {
+        let has_variable = self.has_variable();
+        let mut query_handles = Vec::new();
         let mut symbols = String::new();
+        let mut symbol_handles: SmallVec<[Handle<Symbol>; 8]> = SmallVec::new();
         while let Some(symbol) = self.pop_front(partials) {
             if !symbols.is_empty() {
-                symbols += "\u{241F}";
+                symbols.push('\u{241F}');
             }
-            let symbol = graph[symbol.symbol]
-                .replace("%", "\\%")
-                .replace("_", "\\_")
-                .to_string();
-            symbols += &symbol;
-            // patterns for paths matching a prefix of this stack
-            key_patterns.push("V\u{241E}".to_string() + &symbols);
+            symbols.push_str(&graph[symbol.symbol]);
+            symbol_handles.push(symbol.symbol);
+            let key = SymbolStackQueryKey::Exact {
+                variant: SymbolStackExactVariant::VariablePrefix,
+                symbols: symbol_handles.clone(),
+            };
+            let symbols_clone = symbols.clone();
+            let handle = pool.intern_with(key, || {
+                let mut key_string = String::from("V\u{241E}");
+                key_string.push_str(&symbols_clone);
+                SymbolStackQuery::Exact(key_string)
+            });
+            query_handles.push(handle);
         }
-        // pattern for paths matching exactly this stack
-        key_patterns.push("X\u{241E}".to_string() + &symbols);
-        if self.has_variable() {
-            // patterns for paths for which this stack is a prefix
-            key_patterns.push("_\u{241E}".to_string() + &symbols + "\u{241F}%");
+
+        // Pattern for paths matching exactly this stack without variables.
+        let key = SymbolStackQueryKey::Exact {
+            variant: SymbolStackExactVariant::FullStack,
+            symbols: symbol_handles.clone(),
+        };
+        let symbols_clone = symbols.clone();
+        let exact_handle = pool.intern_with(key, || {
+            let mut exact_key = String::from("X\u{241E}");
+            exact_key.push_str(&symbols_clone);
+            SymbolStackQuery::Exact(exact_key)
+        });
+        query_handles.push(exact_handle);
+
+        if has_variable {
+            let symbols_clone = symbols.clone();
+            let key = SymbolStackQueryKey::Range {
+                variant: SymbolStackRangeVariant::VariablePrefix,
+                symbols: symbol_handles.clone(),
+            };
+            let handle = pool.intern_with(key, || {
+                let mut prefix = String::from("V\u{241E}");
+                prefix.push_str(&symbols_clone);
+                prefix.push('\u{241F}');
+                let end = prefix_upper_bound(&prefix);
+                SymbolStackQuery::Range { start: prefix, end }
+            });
+            query_handles.push(handle);
+
+            let key = SymbolStackQueryKey::Range {
+                variant: SymbolStackRangeVariant::NonVariablePrefix,
+                symbols: symbol_handles,
+            };
+            let handle = pool.intern_with(key, || {
+                let mut prefix = String::from("X\u{241E}");
+                prefix.push_str(&symbols);
+                prefix.push('\u{241F}');
+                let end = prefix_upper_bound(&prefix);
+                SymbolStackQuery::Range { start: prefix, end }
+            });
+            query_handles.push(handle);
         }
-        (key_patterns, "\\".to_string())
+
+        query_handles
     }
 }
 
@@ -815,6 +1125,9 @@ pub struct Stats {
     pub file_cached: usize,
     pub root_path_loads: usize,
     pub root_path_cached: usize,
+    pub root_path_loads_exact: usize,
+    pub root_path_loads_range: usize,
+    pub root_path_load_samples: Vec<String>,
     pub node_path_loads: usize,
     pub node_path_cached: usize,
 }
@@ -829,6 +1142,17 @@ impl Stats {
             file_loads: self.file_loads,
             file_cached: self.file_cached,
             ..Stats::default()
+        }
+    }
+
+    fn record_root_path_load(&mut self, query: &SymbolStackQuery) {
+        match query {
+            SymbolStackQuery::Exact(_) => self.root_path_loads_exact += 1,
+            SymbolStackQuery::Range { .. } => self.root_path_loads_range += 1,
+        }
+        const SAMPLE_LIMIT: usize = 64;
+        if self.root_path_load_samples.len() < SAMPLE_LIMIT {
+            self.root_path_load_samples.push(query.to_string());
         }
     }
 }

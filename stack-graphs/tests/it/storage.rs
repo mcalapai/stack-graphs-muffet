@@ -125,3 +125,64 @@ fn find_candidates_for_shorter_symbol_stack_without_variable() {
     let results = test_foo_bar_root_candidate_paths(&["foo"], false);
     assert_eq!(0, results);
 }
+
+#[test]
+fn find_candidates_for_symbol_stack_with_wildcard_symbols() {
+    let mut reader = {
+        let mut writer = SQLiteWriter::open_in_memory().unwrap();
+
+        let mut graph = StackGraph::new();
+        let file = graph.add_file("special_defs").unwrap();
+        let mut partials = PartialPaths::new();
+
+        let r = StackGraph::root_node();
+        let sym_a = create_pop_symbol_node(&mut graph, file, "na_me%", true);
+        let sym_b = create_pop_symbol_node(&mut graph, file, "other_%value", true);
+
+        let path_with_variable =
+            create_partial_path_and_edges(&mut graph, &mut partials, &[r, sym_a, sym_b]).unwrap();
+
+        let mut path_without_variable = path_with_variable.clone();
+        path_without_variable.eliminate_precondition_stack_variables(&mut partials);
+
+        writer
+            .store_result_for_file(
+                &graph,
+                file,
+                "",
+                &mut partials,
+                vec![&path_with_variable, &path_without_variable],
+            )
+            .unwrap();
+
+        writer.into_reader()
+    };
+
+    {
+        let (graph, partials, _) = reader.get();
+        let file = graph.add_file("special_refs").unwrap();
+
+        let r = StackGraph::root_node();
+        let refs = ["other_%value", "na_me%"]
+            .iter()
+            .map(|symbol| create_push_symbol_node(graph, file, *symbol, true))
+            .chain(std::iter::once(r))
+            .collect_vec();
+        let path = create_partial_path_and_edges(graph, partials, &refs).unwrap();
+
+        reader
+            .load_partial_path_extensions(&path, &NoCancellation)
+            .unwrap();
+
+        let (graph, partials, db) = reader.get();
+        let mut results = Vec::new();
+        db.find_candidate_partial_paths_from_root(
+            graph,
+            partials,
+            Some(path.symbol_stack_postcondition),
+            &mut results,
+        );
+
+        assert_eq!(2, results.len());
+    }
+}
