@@ -23,6 +23,7 @@ use crate::arena::Handle;
 use crate::graph::Degree;
 use crate::graph::File;
 use crate::graph::Node;
+use crate::graph::NodeID;
 use crate::graph::StackGraph;
 use crate::partial::PartialPath;
 use crate::partial::PartialPaths;
@@ -427,6 +428,7 @@ impl SQLiteWriter {
             loaded_graphs: HashSet::new(),
             loaded_node_paths: HashSet::new(),
             loaded_root_paths: HashSet::new(),
+            node_paths_prefetched: HashSet::new(),
             graph: StackGraph::new(),
             partials: PartialPaths::new(),
             db: Database::new(),
@@ -441,6 +443,7 @@ pub struct SQLiteReader {
     loaded_graphs: HashSet<String>,
     loaded_node_paths: HashSet<Handle<Node>>,
     loaded_root_paths: HashSet<SymbolStackQuery>,
+    node_paths_prefetched: HashSet<Handle<File>>,
     graph: StackGraph,
     partials: PartialPaths,
     db: Database,
@@ -464,6 +467,7 @@ impl SQLiteReader {
             loaded_graphs: HashSet::new(),
             loaded_node_paths: HashSet::new(),
             loaded_root_paths: HashSet::new(),
+            node_paths_prefetched: HashSet::new(),
             graph: StackGraph::new(),
             partials: PartialPaths::new(),
             db: Database::new(),
@@ -479,6 +483,7 @@ impl SQLiteReader {
 
         self.loaded_node_paths.clear();
         self.loaded_root_paths.clear();
+        self.node_paths_prefetched.clear();
         self.partials.clear();
         self.db.clear();
 
@@ -491,6 +496,7 @@ impl SQLiteReader {
     pub fn clear_paths(&mut self) {
         self.loaded_node_paths.clear();
         self.loaded_root_paths.clear();
+        self.node_paths_prefetched.clear();
         self.partials.clear();
         self.db.clear();
 
@@ -597,6 +603,57 @@ impl SQLiteReader {
         Ok(())
     }
 
+    fn preload_node_paths_for_file(
+        &mut self,
+        file: Handle<File>,
+        cancellation_flag: &dyn CancellationFlag,
+    ) -> Result<()> {
+        if !self.node_paths_prefetched.insert(file) {
+            return Ok(());
+        }
+
+        let file_name = self.graph[file].name().to_string();
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT local_id, value FROM file_paths WHERE file = ?")?;
+        let mut rows = stmt.query([file_name.as_str()])?;
+
+        #[cfg_attr(not(feature = "copious-debugging"), allow(unused))]
+        let mut count = 0usize;
+        while let Some(row) = rows.next()? {
+            cancellation_flag.check("loading node paths")?;
+            let local_id: u32 = row.get(0)?;
+            let slice = row.get_ref(1)?.as_blob().map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(1, Type::Blob, Box::new(e))
+            })?;
+            let (path_ser, _): (crate::serde::PartialPath, usize) =
+                bincode::borrow_decode_from_slice(slice, BINCODE_CONFIG)?;
+            let path = path_ser.to_partial_path(&mut self.graph, &mut self.partials)?;
+            copious_debugging!(
+                "   > Prefetched {}",
+                path.display(&self.graph, &mut self.partials)
+            );
+            self.db
+                .add_partial_path(&self.graph, &mut self.partials, path);
+
+            if let Some(handle) = self.graph.node_for_id(NodeID::new_in_file(file, local_id)) {
+                self.loaded_node_paths.insert(handle);
+            }
+            count += 1;
+        }
+        copious_debugging!(
+            "   > Prefetched {} node paths for {}",
+            count,
+            file.display(&self.graph)
+        );
+
+        for node in self.graph.nodes_for_file(file) {
+            self.loaded_node_paths.insert(node);
+        }
+
+        Ok(())
+    }
+
     /// Ensure the paths starting at the given node are loaded.
     fn load_paths_for_node(
         &mut self,
@@ -612,32 +669,11 @@ impl SQLiteReader {
         self.stats.node_path_loads += 1;
         let id = self.graph[node].id();
         let file = id.file().expect("file node required");
-        let file = self.graph[file].name();
-
-        let mut stmt = self
-            .conn
-            .prepare_cached("SELECT value FROM file_paths WHERE file = ? AND local_id = ?")?;
-        let mut rows = stmt.query((file, id.local_id()))?;
-
-        #[cfg_attr(not(feature = "copious-debugging"), allow(unused))]
-        let mut count = 0usize;
-        while let Some(row) = rows.next()? {
-            cancellation_flag.check("loading node paths")?;
-            let slice = row.get_ref(0)?.as_blob().map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(0, Type::Blob, Box::new(e))
-            })?;
-            let (path_ser, _): (crate::serde::PartialPath, usize) =
-                bincode::borrow_decode_from_slice(slice, BINCODE_CONFIG)?;
-            let path = path_ser.to_partial_path(&mut self.graph, &mut self.partials)?;
-            copious_debugging!(
-                "   > Loaded {}",
-                path.display(&self.graph, &mut self.partials)
-            );
-            self.db
-                .add_partial_path(&self.graph, &mut self.partials, path);
-            count += 1;
-        }
-        copious_debugging!("   > Loaded {}", count);
+        self.preload_node_paths_for_file(file, cancellation_flag)?;
+        copious_debugging!(
+            "   > Node paths available for {}",
+            file.display(&self.graph)
+        );
         Ok(())
     }
 
