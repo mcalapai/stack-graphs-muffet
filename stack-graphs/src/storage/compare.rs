@@ -381,7 +381,8 @@ fn load_redb_snapshot(path: &Path) -> Result<BackendSnapshot, ComparisonError> {
             let (key, mut values) = entry?;
             let (file, local_id) = parse_node_key(key.value())?;
             while let Some(value) = values.next() {
-                let blob = value?.value();
+                let value = value?; // keep guard alive for the borrow
+                let blob = value.value();
                 let (normalized_blob, summary) =
                     normalize_partial_path(blob, &mut graph, &mut partials)?;
                 let digest = digest_bytes(&normalized_blob);
@@ -404,7 +405,8 @@ fn load_redb_snapshot(path: &Path) -> Result<BackendSnapshot, ComparisonError> {
             let (key, mut values) = entry?;
             let (file, symbol_stack) = parse_root_key(key.value())?;
             while let Some(value) = values.next() {
-                let blob = value?.value();
+                let value = value?; // keep guard alive for the borrow
+                let blob = value.value();
                 let (normalized_blob, summary) =
                     normalize_partial_path(blob, &mut graph, &mut partials)?;
                 let digest = digest_bytes(&normalized_blob);
