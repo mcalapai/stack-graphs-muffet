@@ -41,9 +41,10 @@ use super::{
 
 const METADATA_TABLE: TableDefinition<'static, &str, u64> = TableDefinition::new("metadata");
 const GRAPHS_TABLE: TableDefinition<'static, &str, &[u8]> = TableDefinition::new("graphs");
-const FILE_PATHS_TABLE: TableDefinition<'static, &[u8], &[u8]> = TableDefinition::new("file_paths");
-const ROOT_PATHS_BY_FILE_TABLE: TableDefinition<'static, &[u8], &[u8]> =
-    TableDefinition::new("root_paths_by_file");
+const FILE_PATHS_TABLE: MultimapTableDefinition<'static, &[u8], &[u8]> =
+    MultimapTableDefinition::new("file_paths");
+const ROOT_PATHS_BY_FILE_TABLE: MultimapTableDefinition<'static, &[u8], &[u8]> =
+    MultimapTableDefinition::new("root_paths_by_file");
 const ROOT_PATHS_BY_SYMBOL_TABLE: MultimapTableDefinition<'static, &str, &str> =
     MultimapTableDefinition::new("root_paths_by_symbol");
 
@@ -324,25 +325,28 @@ impl RedbReader {
         let file_name = self.graph[file].name().to_string();
         let (start, end) = node_range_bounds(&file_name);
         let txn = self.db.begin_read()?;
-        let table = txn.open_table(FILE_PATHS_TABLE)?;
+        let table = txn.open_multimap_table(FILE_PATHS_TABLE)?;
         let mut iter = table.range(start.as_slice()..=end.as_slice())?;
-        while let Some(Ok((key, value))) = iter.next() {
+        while let Some(Ok((key, mut values))) = iter.next() {
             cancellation_flag.check("loading node paths")?;
             let local_id = decode_local_id(key.value())?;
-            let blob = value.value();
-            let path = decode_partial_path(blob, &mut self.graph, &mut self.partials)?;
-            let canonical_bytes = if self.stats.should_record_node_sample() {
-                let mut buf = Vec::new();
-                encode_partial_path(&self.graph, &mut self.partials, &path, &mut buf)
-                    .map_err(RedbError::from)?;
-                Some(buf)
-            } else {
-                None
-            };
-            self.stats
-                .record_node_path_blob(&file_name, local_id, blob, canonical_bytes);
-            self.database
-                .add_partial_path(&self.graph, &mut self.partials, path);
+            while let Some(Ok(value)) = values.next() {
+                cancellation_flag.check("loading node paths")?;
+                let blob = value.value();
+                let path = decode_partial_path(blob, &mut self.graph, &mut self.partials)?;
+                let canonical_bytes = if self.stats.should_record_node_sample() {
+                    let mut buf = Vec::new();
+                    encode_partial_path(&self.graph, &mut self.partials, &path, &mut buf)
+                        .map_err(RedbError::from)?;
+                    Some(buf)
+                } else {
+                    None
+                };
+                self.stats
+                    .record_node_path_blob(&file_name, local_id, blob, canonical_bytes);
+                self.database
+                    .add_partial_path(&self.graph, &mut self.partials, path);
+            }
             if let Some(handle) = self.graph.node_for_id(NodeID::new_in_file(file, local_id)) {
                 self.loaded_node_paths.insert(handle);
             }
@@ -361,9 +365,9 @@ impl RedbReader {
         let file_name = self.graph[file].name().to_string();
         let (start, end) = root_file_range_bounds(&file_name);
         let txn = self.db.begin_read()?;
-        let table = txn.open_table(ROOT_PATHS_BY_FILE_TABLE)?;
+        let table = txn.open_multimap_table(ROOT_PATHS_BY_FILE_TABLE)?;
         let mut iter = table.range(start.as_slice()..=end.as_slice())?;
-        while let Some(Ok((key, value))) = iter.next() {
+        while let Some(Ok((key, mut values))) = iter.next() {
             cancellation_flag.check("loading root paths")?;
             let want_sample = self.stats.should_record_root_sample();
             let symbol_stack_for_sample = if want_sample {
@@ -371,41 +375,44 @@ impl RedbReader {
             } else {
                 None
             };
-            let blob = value.value();
-            let path = decode_partial_path(blob, &mut self.graph, &mut self.partials)?;
-            let canonical_bytes = if want_sample {
-                let mut buf = Vec::new();
-                encode_partial_path(&self.graph, &mut self.partials, &path, &mut buf)
-                    .map_err(RedbError::from)?;
-                Some(buf)
-            } else {
-                None
-            };
-            self.stats.record_root_path_blob(
-                &file_name,
-                symbol_stack_for_sample.as_deref(),
-                blob,
-                canonical_bytes,
-            );
-            let handles = path.symbol_stack_precondition.storage_key_queries(
-                &self.graph,
-                &mut self.partials,
-                &mut self.symbol_stack_queries,
-            );
-            for handle in handles {
-                let key = self.symbol_stack_queries.get_key(handle);
-                if matches!(
-                    key,
-                    SymbolStackQueryKey::Exact {
-                        variant: SymbolStackExactVariant::FullStack,
-                        ..
+            while let Some(Ok(value)) = values.next() {
+                cancellation_flag.check("loading root paths")?;
+                let blob = value.value();
+                let path = decode_partial_path(blob, &mut self.graph, &mut self.partials)?;
+                let canonical_bytes = if want_sample {
+                    let mut buf = Vec::new();
+                    encode_partial_path(&self.graph, &mut self.partials, &path, &mut buf)
+                        .map_err(RedbError::from)?;
+                    Some(buf)
+                } else {
+                    None
+                };
+                self.stats.record_root_path_blob(
+                    &file_name,
+                    symbol_stack_for_sample.as_deref(),
+                    blob,
+                    canonical_bytes,
+                );
+                let handles = path.symbol_stack_precondition.storage_key_queries(
+                    &self.graph,
+                    &mut self.partials,
+                    &mut self.symbol_stack_queries,
+                );
+                for handle in handles {
+                    let key = self.symbol_stack_queries.get_key(handle);
+                    if matches!(
+                        key,
+                        SymbolStackQueryKey::Exact {
+                            variant: SymbolStackExactVariant::FullStack,
+                            ..
+                        }
+                    ) {
+                        self.loaded_root_paths.insert(handle);
                     }
-                ) {
-                    self.loaded_root_paths.insert(handle);
                 }
+                self.database
+                    .add_partial_path(&self.graph, &mut self.partials, path);
             }
-            self.database
-                .add_partial_path(&self.graph, &mut self.partials, path);
         }
         Ok(())
     }
@@ -737,8 +744,8 @@ impl RedbWriter {
                 .record_graph_write(file_name.as_str(), tag, encoded.as_slice());
         }
         {
-            let mut node_table = txn.open_table(FILE_PATHS_TABLE)?;
-            let mut root_by_file = txn.open_table(ROOT_PATHS_BY_FILE_TABLE)?;
+            let mut node_table = txn.open_multimap_table(FILE_PATHS_TABLE)?;
+            let mut root_by_file = txn.open_multimap_table(ROOT_PATHS_BY_FILE_TABLE)?;
             let mut root_by_symbol = txn.open_multimap_table(ROOT_PATHS_BY_SYMBOL_TABLE)?;
             for path in paths {
                 encode_partial_path(graph, partials, path, &mut self.path_buf)
@@ -809,35 +816,61 @@ impl RedbWriter {
         drop(graphs);
 
         {
-            let mut nodes = txn.open_table(FILE_PATHS_TABLE)?;
-            let mut drain = nodes.drain::<&[u8]>(..)?;
-            while let Some(entry) = drain.next() {
-                entry?;
-            }
-        }
-
-        {
-            let mut roots = txn.open_table(ROOT_PATHS_BY_FILE_TABLE)?;
-            let mut drain = roots.drain::<&[u8]>(..)?;
-            while let Some(entry) = drain.next() {
-                entry?;
-            }
-        }
-
-        {
-            let mut symbols = txn.open_multimap_table(ROOT_PATHS_BY_SYMBOL_TABLE)?;
-            let mut keys = Vec::new();
+            let mut nodes = txn.open_multimap_table(FILE_PATHS_TABLE)?;
+            let mut keys: Vec<Vec<u8>> = Vec::new();
             {
-                let mut iter = symbols.iter()?;
+                let mut iter = nodes.iter()?;
                 while let Some(entry) = iter.next() {
                     let (key, mut values) = entry?;
-                    keys.push(key.value().to_string());
+                    keys.push(key.value().to_vec());
                     while let Some(value) = values.next() {
                         value?;
                     }
                 }
             }
             for key in keys {
+                let mut removed = nodes.remove_all(key.as_slice())?;
+                while let Some(value) = removed.next() {
+                    value?;
+                }
+            }
+        }
+
+        {
+            let mut roots = txn.open_multimap_table(ROOT_PATHS_BY_FILE_TABLE)?;
+            let mut keys: Vec<Vec<u8>> = Vec::new();
+            {
+                let mut iter = roots.iter()?;
+                while let Some(entry) = iter.next() {
+                    let (key, mut values) = entry?;
+                    keys.push(key.value().to_vec());
+                    while let Some(value) = values.next() {
+                        value?;
+                    }
+                }
+            }
+            for key in keys {
+                let mut removed = roots.remove_all(key.as_slice())?;
+                while let Some(value) = removed.next() {
+                    value?;
+                }
+            }
+        }
+
+        {
+            let mut symbols = txn.open_multimap_table(ROOT_PATHS_BY_SYMBOL_TABLE)?;
+            let mut symbol_keys = Vec::new();
+            {
+                let mut iter = symbols.iter()?;
+                while let Some(entry) = iter.next() {
+                    let (key, mut values) = entry?;
+                    symbol_keys.push(key.value().to_string());
+                    while let Some(value) = values.next() {
+                        value?;
+                    }
+                }
+            }
+            for key in symbol_keys {
                 let mut removed = symbols.remove_all(key.as_str())?;
                 while let Some(value) = removed.next() {
                     value?;
@@ -859,21 +892,47 @@ impl RedbWriter {
 
         let (start, end) = node_range_bounds(file);
         {
-            let mut nodes = txn.open_table(FILE_PATHS_TABLE)?;
-            let mut drain = nodes.drain(start.as_slice()..=end.as_slice())?;
-            while let Some(entry) = drain.next() {
-                entry?;
+            let mut nodes = txn.open_multimap_table(FILE_PATHS_TABLE)?;
+            let mut keys: Vec<Vec<u8>> = Vec::new();
+            {
+                let mut range = nodes.range(start.as_slice()..=end.as_slice())?;
+                while let Some(entry) = range.next() {
+                    let (key, mut values) = entry?;
+                    keys.push(key.value().to_vec());
+                    while let Some(value) = values.next() {
+                        value?;
+                    }
+                }
+            }
+            for key in keys {
+                let mut removed_vals = nodes.remove_all(key.as_slice())?;
+                while let Some(value) = removed_vals.next() {
+                    value?;
+                }
             }
         }
 
         let (start_root, end_root) = root_file_range_bounds(file);
         let mut symbols_to_remove = Vec::new();
         {
-            let mut roots = txn.open_table(ROOT_PATHS_BY_FILE_TABLE)?;
-            let mut drain = roots.drain(start_root.as_slice()..=end_root.as_slice())?;
-            while let Some(entry) = drain.next() {
-                let (key, _value) = entry?;
-                symbols_to_remove.push(decode_root_symbol(key.value())?);
+            let mut roots = txn.open_multimap_table(ROOT_PATHS_BY_FILE_TABLE)?;
+            let mut keys: Vec<Vec<u8>> = Vec::new();
+            {
+                let mut range = roots.range(start_root.as_slice()..=end_root.as_slice())?;
+                while let Some(entry) = range.next() {
+                    let (key, mut values) = entry?;
+                    symbols_to_remove.push(decode_root_symbol(key.value())?);
+                    keys.push(key.value().to_vec());
+                    while let Some(value) = values.next() {
+                        value?;
+                    }
+                }
+            }
+            for key in keys {
+                let mut removed_vals = roots.remove_all(key.as_slice())?;
+                while let Some(value) = removed_vals.next() {
+                    value?;
+                }
             }
         }
 
@@ -1223,7 +1282,7 @@ pub fn convert_sqlite_to_redb(sqlite_path: &Path, redb_path: &Path) -> Result<()
     }
 
     {
-        let mut file_table = txn.open_table(FILE_PATHS_TABLE)?;
+        let mut file_table = txn.open_multimap_table(FILE_PATHS_TABLE)?;
         let mut stmt = sqlite.prepare("SELECT file, local_id, value FROM file_paths")?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
@@ -1236,7 +1295,7 @@ pub fn convert_sqlite_to_redb(sqlite_path: &Path, redb_path: &Path) -> Result<()
     }
 
     {
-        let mut file_table = txn.open_table(ROOT_PATHS_BY_FILE_TABLE)?;
+        let mut file_table = txn.open_multimap_table(ROOT_PATHS_BY_FILE_TABLE)?;
         let mut symbol_table = txn.open_multimap_table(ROOT_PATHS_BY_SYMBOL_TABLE)?;
         let mut stmt = sqlite.prepare("SELECT file, symbol_stack, value FROM root_paths")?;
         let mut rows = stmt.query([])?;

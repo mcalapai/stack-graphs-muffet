@@ -7,7 +7,7 @@
 
 #![cfg(feature = "storage-redb")]
 
-use redb::TableDefinition;
+use redb::MultimapTableDefinition;
 use stack_graphs::graph::StackGraph;
 use stack_graphs::partial::PartialPaths;
 use stack_graphs::storage::compare::compare_backends;
@@ -15,10 +15,7 @@ use stack_graphs::storage::redb::convert_sqlite_to_redb;
 use stack_graphs::storage::{SQLiteWriter, StorageWriter};
 use tempfile::TempDir;
 
-use crate::util::{
-    create_partial_path_and_edges,
-    create_pop_symbol_node,
-};
+use crate::util::{create_partial_path_and_edges, create_pop_symbol_node};
 
 #[test]
 fn reports_no_differences_for_matching_backends() -> Result<(), Box<dyn std::error::Error>> {
@@ -87,13 +84,17 @@ fn detects_missing_records_in_redb() -> Result<(), Box<dyn std::error::Error>> {
     convert_sqlite_to_redb(&sqlite_path, &redb_path)?;
 
     // Remove a node path record from the redb database.
-    const FILE_PATHS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("file_paths");
+    const FILE_PATHS: MultimapTableDefinition<&[u8], &[u8]> =
+        MultimapTableDefinition::new("file_paths");
     let db = redb::Database::open(&redb_path)?;
     let mut txn = db.begin_write()?;
-    let mut table = txn.open_table(FILE_PATHS)?;
+    let mut table = txn.open_multimap_table(FILE_PATHS)?;
     let local_id = graph[foo].id().local_id();
     let key = encode_node_key("test1", local_id);
-    table.remove(key.as_slice())?;
+    let mut removed = table.remove_all(key.as_slice())?;
+    while let Some(value) = removed.next() {
+        value?;
+    }
     txn.commit()?;
 
     let report = compare_backends(&sqlite_path, &redb_path)?;

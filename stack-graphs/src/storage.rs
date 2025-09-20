@@ -58,7 +58,7 @@ use smallvec::SmallVec;
 
 use self::encoding::{decode_partial_path, encode_partial_path};
 
-pub(crate) const VERSION: usize = 7;
+pub(crate) const VERSION: usize = 8;
 
 const SCHEMA: &str = r#"
         CREATE TABLE metadata (

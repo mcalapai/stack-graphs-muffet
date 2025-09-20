@@ -10,8 +10,8 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use redb::{
-    Database, DatabaseError, ReadableTable, StorageError as RedbStorageError, TableDefinition,
-    TableError, TransactionError,
+    Database, DatabaseError, MultimapTableDefinition, ReadableMultimapTable, ReadableTable,
+    StorageError as RedbStorageError, TableDefinition, TableError, TransactionError,
 };
 use rusqlite::Connection;
 use serde::Serialize;
@@ -27,9 +27,10 @@ use crate::storage::{StorageError, BINCODE_CONFIG, VERSION};
 
 const METADATA_TABLE: TableDefinition<'static, &str, u64> = TableDefinition::new("metadata");
 const GRAPHS_TABLE: TableDefinition<'static, &str, &[u8]> = TableDefinition::new("graphs");
-const FILE_PATHS_TABLE: TableDefinition<'static, &[u8], &[u8]> = TableDefinition::new("file_paths");
-const ROOT_PATHS_BY_FILE_TABLE: TableDefinition<'static, &[u8], &[u8]> =
-    TableDefinition::new("root_paths_by_file");
+const FILE_PATHS_TABLE: MultimapTableDefinition<'static, &[u8], &[u8]> =
+    MultimapTableDefinition::new("file_paths");
+const ROOT_PATHS_BY_FILE_TABLE: MultimapTableDefinition<'static, &[u8], &[u8]> =
+    MultimapTableDefinition::new("root_paths_by_file");
 
 #[derive(Debug, Error)]
 pub enum ComparisonError {
@@ -374,42 +375,46 @@ fn load_redb_snapshot(path: &Path) -> Result<BackendSnapshot, ComparisonError> {
     let mut node_paths = Vec::new();
     {
         let txn = db.begin_read()?;
-        let table = txn.open_table(FILE_PATHS_TABLE)?;
+        let table = txn.open_multimap_table(FILE_PATHS_TABLE)?;
         let mut iter = table.iter()?;
         while let Some(entry) = iter.next() {
-            let (key, value) = entry?;
+            let (key, mut values) = entry?;
             let (file, local_id) = parse_node_key(key.value())?;
-            let blob = value.value();
-            let (normalized_blob, summary) =
-                normalize_partial_path(blob, &mut graph, &mut partials)?;
-            let digest = digest_bytes(&normalized_blob);
-            node_paths.push(NodePathRecordData {
-                file,
-                local_id,
-                digest,
-                summary,
-            });
+            while let Some(value) = values.next() {
+                let blob = value?.value();
+                let (normalized_blob, summary) =
+                    normalize_partial_path(blob, &mut graph, &mut partials)?;
+                let digest = digest_bytes(&normalized_blob);
+                node_paths.push(NodePathRecordData {
+                    file: file.clone(),
+                    local_id,
+                    digest,
+                    summary,
+                });
+            }
         }
     }
 
     let mut root_paths = Vec::new();
     {
         let txn = db.begin_read()?;
-        let table = txn.open_table(ROOT_PATHS_BY_FILE_TABLE)?;
+        let table = txn.open_multimap_table(ROOT_PATHS_BY_FILE_TABLE)?;
         let mut iter = table.iter()?;
         while let Some(entry) = iter.next() {
-            let (key, value) = entry?;
+            let (key, mut values) = entry?;
             let (file, symbol_stack) = parse_root_key(key.value())?;
-            let blob = value.value();
-            let (normalized_blob, summary) =
-                normalize_partial_path(blob, &mut graph, &mut partials)?;
-            let digest = digest_bytes(&normalized_blob);
-            root_paths.push(RootPathRecordData {
-                file,
-                symbol_stack,
-                digest,
-                summary,
-            });
+            while let Some(value) = values.next() {
+                let blob = value?.value();
+                let (normalized_blob, summary) =
+                    normalize_partial_path(blob, &mut graph, &mut partials)?;
+                let digest = digest_bytes(&normalized_blob);
+                root_paths.push(RootPathRecordData {
+                    file: file.clone(),
+                    symbol_stack: symbol_stack.clone(),
+                    digest,
+                    summary,
+                });
+            }
         }
     }
 
