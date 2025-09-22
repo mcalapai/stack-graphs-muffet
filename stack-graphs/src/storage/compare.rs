@@ -505,18 +505,47 @@ fn compare_file_paths(
     sqlite: Vec<NodePathRecordData>,
     redb: Vec<NodePathRecordData>,
 ) -> TableDiff<NodePathEntry, NodePathMismatch> {
+    use std::cmp::Ordering;
+    use std::collections::{BTreeMap, BTreeSet};
+
     let sqlite_count = sqlite.len();
     let redb_count = redb.len();
 
-    let sqlite_map: BTreeMap<_, _> = sqlite
-        .into_iter()
-        .map(|record| ((record.file.clone(), record.local_id), record))
-        .collect();
-    let redb_map: BTreeMap<_, _> = redb
-        .into_iter()
-        .map(|record| ((record.file.clone(), record.local_id), record))
-        .collect();
+    // Group all records per (file, local_id) to preserve multiplicity
+    let mut sqlite_map: BTreeMap<(String, u32), Vec<NodePathRecordData>> = BTreeMap::new();
+    for record in sqlite {
+        sqlite_map
+            .entry((record.file.clone(), record.local_id))
+            .or_default()
+            .push(record);
+    }
+    let mut redb_map: BTreeMap<(String, u32), Vec<NodePathRecordData>> = BTreeMap::new();
+    for record in redb {
+        redb_map
+            .entry((record.file.clone(), record.local_id))
+            .or_default()
+            .push(record);
+    }
 
+    // Deterministic ordering inside each bucket: sort by (digest, summary)
+    let sort_records = |records: &mut Vec<NodePathRecordData>| {
+        records.sort_by(|a, b| {
+            let od = a.digest.cmp(&b.digest);
+            if od == Ordering::Equal {
+                a.summary.cmp(&b.summary)
+            } else {
+                od
+            }
+        });
+    };
+    for records in sqlite_map.values_mut() {
+        sort_records(records);
+    }
+    for records in redb_map.values_mut() {
+        sort_records(records);
+    }
+
+    // Compare multisets per key
     let mut keys = BTreeSet::new();
     keys.extend(sqlite_map.keys().cloned());
     keys.extend(redb_map.keys().cloned());
@@ -526,33 +555,78 @@ fn compare_file_paths(
     let mut mismatched = Vec::new();
 
     for key in keys {
-        match (sqlite_map.get(&key), redb_map.get(&key)) {
-            (Some(sqlite_record), Some(redb_record)) => {
-                let mut differences = Vec::new();
-                if sqlite_record.digest != redb_record.digest {
-                    differences.push(format!(
-                        "partial path digest differs: sqlite={}, redb={}",
-                        sqlite_record.digest, redb_record.digest
-                    ));
-                }
-                if sqlite_record.summary != redb_record.summary {
-                    differences.push(format!(
-                        "partial path summary differs: sqlite='{}', redb='{}'",
-                        sqlite_record.summary, redb_record.summary
-                    ));
-                }
-                if !differences.is_empty() {
-                    mismatched.push(NodePathMismatch {
-                        file: key.0.clone(),
-                        local_id: key.1,
-                        sqlite: sqlite_record.to_entry(),
-                        redb: redb_record.to_entry(),
-                        differences,
-                    });
+        let sqlite_records = sqlite_map.get(&key);
+        let redb_records = redb_map.get(&key);
+        match (sqlite_records, redb_records) {
+            (Some(s), Some(r)) => {
+                if s.len() == r.len() {
+                    // Same cardinality: compare pairwise (deterministic order)
+                    for (se, re) in s.iter().zip(r.iter()) {
+                        let mut differences = Vec::new();
+                        if se.digest != re.digest {
+                            differences.push(format!(
+                                "partial path digest differs: sqlite={}, redb={}",
+                                se.digest, re.digest
+                            ));
+                        }
+                        if se.summary != re.summary {
+                            differences.push(format!(
+                                "partial path summary differs: sqlite='{}', redb='{}'",
+                                se.summary, re.summary
+                            ));
+                        }
+                        if !differences.is_empty() {
+                            mismatched.push(NodePathMismatch {
+                                file: key.0.clone(),
+                                local_id: key.1,
+                                sqlite: se.to_entry(),
+                                redb: re.to_entry(),
+                                differences,
+                            });
+                        }
+                    }
+                } else {
+                    // Different cardinality: multiset diff
+                    let mut si = 0usize;
+                    let mut ri = 0usize;
+                    while si < s.len() && ri < r.len() {
+                        let sk = (&s[si].digest, &s[si].summary);
+                        let rk = (&r[ri].digest, &r[ri].summary);
+                        match sk.cmp(&rk) {
+                            Ordering::Equal => {
+                                si += 1;
+                                ri += 1;
+                            }
+                            Ordering::Less => {
+                                missing.push(s[si].to_entry());
+                                si += 1;
+                            }
+                            Ordering::Greater => {
+                                extra.push(r[ri].to_entry());
+                                ri += 1;
+                            }
+                        }
+                    }
+                    while si < s.len() {
+                        missing.push(s[si].to_entry());
+                        si += 1;
+                    }
+                    while ri < r.len() {
+                        extra.push(r[ri].to_entry());
+                        ri += 1;
+                    }
                 }
             }
-            (Some(sqlite_record), None) => missing.push(sqlite_record.to_entry()),
-            (None, Some(redb_record)) => extra.push(redb_record.to_entry()),
+            (Some(s), None) => {
+                for se in s {
+                    missing.push(se.to_entry());
+                }
+            }
+            (None, Some(r)) => {
+                for re in r {
+                    extra.push(re.to_entry());
+                }
+            }
             (None, None) => {}
         }
     }

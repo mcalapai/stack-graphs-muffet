@@ -259,7 +259,7 @@ impl RedbReader {
         }
     }
 
-    fn load_graph_for_file(&mut self, file: &str) -> Result<Handle<File>> {
+    pub fn load_graph_for_file(&mut self, file: &str) -> Result<Handle<File>> {
         if let Some(handle) = self.graph.get_file(file) {
             if self.loaded_graphs.contains(&handle) {
                 self.stats.file_cached += 1;
