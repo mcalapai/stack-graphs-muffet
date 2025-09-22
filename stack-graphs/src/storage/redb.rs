@@ -540,6 +540,11 @@ impl RedbReader {
     pub fn database(&self) -> &Database {
         &self.database
     }
+
+    /// Get the stack graph, partial paths arena, and path database for the currently loaded data.
+    pub fn get(&mut self) -> (&mut StackGraph, &mut PartialPaths, &mut Database) {
+        (&mut self.graph, &mut self.partials, &mut self.database)
+    }
 }
 
 impl StorageReader for RedbReader {
