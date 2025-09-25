@@ -16,8 +16,8 @@ use bincode::error::DecodeError;
 use redb::backends::InMemoryBackend;
 use redb::{
     CommitError, Database as RedbDatabase, DatabaseError, MultimapTableDefinition,
-    ReadableMultimapTable, ReadableTable, StorageError as RedbStorageError, TableDefinition,
-    TableError, TransactionError, WriteTransaction,
+    ReadableDatabase, ReadableMultimapTable, ReadableTable, StorageError as RedbStorageError,
+    TableDefinition, TableError, TransactionError, WriteTransaction,
 };
 use rusqlite::Connection;
 use thiserror::Error;
@@ -808,16 +808,18 @@ impl RedbWriter {
         RedbReader::from_database(self.db)
     }
 
-    fn clean_all_inner(txn: &mut WriteTransaction<'_>) -> Result<usize> {
+    fn clean_all_inner(txn: &mut WriteTransaction) -> Result<usize> {
         let mut graphs = txn.open_table(GRAPHS_TABLE)?;
         let mut count = 0usize;
         {
-            let mut drain = graphs.drain::<&str>(..)?;
-            while let Some(entry) = drain.next() {
-                entry?;
-                count += 1;
+            // redb v3: drain() removed. Use extract_if and fully consume the iterator.
+            let mut removed = graphs.extract_if(|_, _| true)?;
+            while let Some(entry) = removed.next() {
+                entry?; // consuming the item performs the removal
+                count += 1; // preserve the previous count semantics
             }
         }
+
         drop(graphs);
 
         {
@@ -886,7 +888,7 @@ impl RedbWriter {
         Ok(count)
     }
 
-    fn clean_file_inner(txn: &mut WriteTransaction<'_>, file: &str) -> Result<usize> {
+    fn clean_file_inner(txn: &mut WriteTransaction, file: &str) -> Result<usize> {
         let mut removed = 0usize;
         {
             let mut graphs = txn.open_table(GRAPHS_TABLE)?;
@@ -952,7 +954,7 @@ impl RedbWriter {
     }
 
     fn clean_file_or_directory_inner(
-        txn: &mut WriteTransaction<'_>,
+        txn: &mut WriteTransaction,
         file_or_directory: &Path,
     ) -> Result<usize> {
         let graphs = txn.open_table(GRAPHS_TABLE)?;

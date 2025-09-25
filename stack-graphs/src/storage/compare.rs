@@ -10,8 +10,8 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use redb::{
-    Database, DatabaseError, MultimapTableDefinition, ReadableMultimapTable, ReadableTable,
-    StorageError as RedbStorageError, TableDefinition, TableError, TransactionError,
+    Database, DatabaseError, MultimapTableDefinition, ReadableDatabase, ReadableMultimapTable,
+    ReadableTable, StorageError as RedbStorageError, TableDefinition, TableError, TransactionError,
 };
 use rusqlite::Connection;
 use serde::Serialize;
