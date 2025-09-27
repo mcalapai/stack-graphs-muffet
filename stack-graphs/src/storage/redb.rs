@@ -11,13 +11,15 @@ use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use bincode::error::DecodeError;
 use redb::backends::InMemoryBackend;
 use redb::{
     CommitError, Database as RedbDatabase, DatabaseError, MultimapTableDefinition,
-    ReadableDatabase, ReadableMultimapTable, ReadableTable, StorageError as RedbStorageError,
-    TableDefinition, TableError, TransactionError, WriteTransaction,
+    ReadOnlyDatabase, ReadTransaction, ReadableDatabase, ReadableMultimapTable, ReadableTable,
+    StorageError as RedbStorageError, TableDefinition, TableError, TransactionError,
+    WriteTransaction,
 };
 use rusqlite::Connection;
 use thiserror::Error;
@@ -151,8 +153,11 @@ fn ensure_metadata_initialized(db: &RedbDatabase) -> Result<()> {
     Ok(())
 }
 
-fn check_metadata_version(db: &RedbDatabase) -> Result<()> {
-    let txn = db.begin_read()?;
+fn check_metadata_version<D>(db: &D) -> Result<()>
+where
+    D: ReadableDatabase,
+{
+    let txn = db.begin_read().map_err(|e| RedbError::Redb(e.into()))?;
     let table = txn.open_table(METADATA_TABLE)?;
     if let Some(version) = table.get("version")? {
         let version = version.value();
@@ -164,8 +169,11 @@ fn check_metadata_version(db: &RedbDatabase) -> Result<()> {
     Err(RedbError::Corrupt("missing metadata version".into()))
 }
 
-fn read_graph_record(db: &RedbDatabase, file: &str) -> Result<Option<GraphRecord>> {
-    let txn = db.begin_read()?;
+fn read_graph_record_generic<D>(db: &D, file: &str) -> Result<Option<GraphRecord>>
+where
+    D: ReadableDatabase,
+{
+    let txn = db.begin_read().map_err(|e| RedbError::Redb(e.into()))?;
     let table = txn.open_table(GRAPHS_TABLE)?;
     let record = table
         .get(file)?
@@ -174,8 +182,39 @@ fn read_graph_record(db: &RedbDatabase, file: &str) -> Result<Option<GraphRecord
     Ok(record)
 }
 
+fn read_graph_record(db: &DbHandle, file: &str) -> Result<Option<GraphRecord>> {
+    match db {
+        DbHandle::Writable(inner) => read_graph_record_generic(inner.as_ref(), file),
+        DbHandle::ReadOnly(inner) => read_graph_record_generic(inner.as_ref(), file),
+    }
+}
+
+#[derive(Clone)]
+enum DbHandle {
+    Writable(Arc<RedbDatabase>),
+    ReadOnly(Arc<ReadOnlyDatabase>),
+}
+
+impl DbHandle {
+    fn begin_read(&self) -> Result<ReadTransaction> {
+        match self {
+            DbHandle::Writable(db) => db.begin_read().map_err(|e| RedbError::Redb(e.into())),
+            DbHandle::ReadOnly(db) => db.begin_read().map_err(|e| RedbError::Redb(e.into())),
+        }
+    }
+
+    fn as_writable(&self) -> Option<&Arc<RedbDatabase>> {
+        if let DbHandle::Writable(db) = self {
+            Some(db)
+        } else {
+            None
+        }
+    }
+}
+
 pub struct RedbReader {
-    db: RedbDatabase,
+    db: DbHandle,
+    active_read: Option<ReadTransaction>,
     loaded_graphs: HashSet<Handle<File>>,
     loaded_node_paths: HashSet<Handle<Node>>,
     loaded_root_paths: HashSet<SymbolStackQueryHandle>,
@@ -202,9 +241,41 @@ impl RedbReader {
     }
 
     pub fn from_database(db: RedbDatabase) -> Result<Self> {
-        check_metadata_version(&db)?;
+        Self::new_with_handle(DbHandle::Writable(Arc::new(db)))
+    }
+
+    pub fn from_shared_database(db: Arc<RedbDatabase>) -> Result<Self> {
+        Self::new_with_handle(DbHandle::Writable(db))
+    }
+
+    pub fn from_readonly_database(db: ReadOnlyDatabase) -> Result<Self> {
+        Self::new_with_handle(DbHandle::ReadOnly(Arc::new(db)))
+    }
+
+    pub fn from_shared_readonly_database(db: Arc<ReadOnlyDatabase>) -> Result<Self> {
+        Self::new_with_handle(DbHandle::ReadOnly(db))
+    }
+
+    pub fn from_read_txn(db: Arc<RedbDatabase>, txn: ReadTransaction) -> Result<Self> {
+        let mut reader = Self::new_with_handle(DbHandle::Writable(db))?;
+        reader.active_read = Some(txn);
+        Ok(reader)
+    }
+
+    pub fn from_read_txn_readonly(db: Arc<ReadOnlyDatabase>, txn: ReadTransaction) -> Result<Self> {
+        let mut reader = Self::new_with_handle(DbHandle::ReadOnly(db))?;
+        reader.active_read = Some(txn);
+        Ok(reader)
+    }
+
+    fn new_with_handle(db: DbHandle) -> Result<Self> {
+        match &db {
+            DbHandle::Writable(handle) => check_metadata_version(handle.as_ref())?,
+            DbHandle::ReadOnly(handle) => check_metadata_version(handle.as_ref())?,
+        }
         Ok(Self {
             db,
+            active_read: None,
             loaded_graphs: HashSet::new(),
             loaded_node_paths: HashSet::new(),
             loaded_root_paths: HashSet::new(),
@@ -216,6 +287,20 @@ impl RedbReader {
             stats: Stats::default(),
             symbol_stack_queries: SymbolStackQueryPool::new(),
         })
+    }
+
+    fn with_read_txn<T, F>(&mut self, f: F) -> Result<T>
+    where
+        F: FnOnce(&ReadTransaction, &mut Self) -> Result<T>,
+    {
+        if let Some(txn) = self.active_read.take() {
+            let res = f(&txn, self);
+            self.active_read = Some(txn);
+            res
+        } else {
+            let txn = self.db.begin_read()?;
+            f(&txn, self)
+        }
     }
 
     pub fn clear(&mut self) {
@@ -267,36 +352,38 @@ impl RedbReader {
             }
         }
 
-        self.stats.file_loads += 1;
-        let txn = self.db.begin_read()?;
-        let table = txn.open_table(GRAPHS_TABLE)?;
-        let value = table
-            .get(file)?
-            .ok_or_else(|| RedbError::Corrupt(format!("missing graph for {file}")))?;
-        let record = GraphRecord::decode(value.value())?;
-        let (file_graph, _) = bincode::decode_from_slice::<serde::StackGraph, _>(
-            record.graph_blob.as_slice(),
-            BINCODE_CONFIG,
-        )?;
-        let canonical_bytes = if self.stats.should_record_graph_sample() {
-            Some(
-                bincode::encode_to_vec(&file_graph, BINCODE_CONFIG)
-                    .map_err(StorageError::from)
-                    .map_err(RedbError::from)?,
-            )
-        } else {
-            None
-        };
-        self.stats.record_graph_blob(
-            file,
-            Some(record.tag.as_str()),
-            record.graph_blob.as_slice(),
-            canonical_bytes,
-        );
-        file_graph.load_into(&mut self.graph)?;
-        let handle = self.graph.get_file(file).expect("loaded file to exist");
-        self.loaded_graphs.insert(handle);
-        Ok(handle)
+        self.with_read_txn(|txn, this| {
+            this.stats.file_loads += 1;
+
+            let table = txn.open_table(GRAPHS_TABLE)?;
+            let value = table
+                .get(file)?
+                .ok_or_else(|| RedbError::Corrupt(format!("missing graph for {file}")))?;
+            let record = GraphRecord::decode(value.value())?;
+            let (file_graph, _) = bincode::decode_from_slice::<serde::StackGraph, _>(
+                record.graph_blob.as_slice(),
+                BINCODE_CONFIG,
+            )?;
+            let canonical_bytes = if this.stats.should_record_graph_sample() {
+                Some(
+                    bincode::encode_to_vec(&file_graph, BINCODE_CONFIG)
+                        .map_err(StorageError::from)
+                        .map_err(RedbError::from)?,
+                )
+            } else {
+                None
+            };
+            this.stats.record_graph_blob(
+                file,
+                Some(record.tag.as_str()),
+                record.graph_blob.as_slice(),
+                canonical_bytes,
+            );
+            file_graph.load_into(&mut this.graph)?;
+            let handle = this.graph.get_file(file).expect("loaded file to exist");
+            this.loaded_graphs.insert(handle);
+            Ok(handle)
+        })
     }
 
     fn load_graphs_for_file_or_directory(
@@ -324,34 +411,35 @@ impl RedbReader {
         }
         let file_name = self.graph[file].name().to_string();
         let (start, end) = node_range_bounds(&file_name);
-        let txn = self.db.begin_read()?;
-        let table = txn.open_multimap_table(FILE_PATHS_TABLE)?;
-        let mut iter = table.range(start.as_slice()..=end.as_slice())?;
-        while let Some(Ok((key, mut values))) = iter.next() {
-            cancellation_flag.check("loading node paths")?;
-            let local_id = decode_local_id(key.value())?;
-            while let Some(Ok(value)) = values.next() {
+        self.with_read_txn(|txn, this| {
+            let table = txn.open_multimap_table(FILE_PATHS_TABLE)?;
+            let mut iter = table.range(start.as_slice()..=end.as_slice())?;
+            while let Some(Ok((key, mut values))) = iter.next() {
                 cancellation_flag.check("loading node paths")?;
-                let blob = value.value();
-                let path = decode_partial_path(blob, &mut self.graph, &mut self.partials)?;
-                let canonical_bytes = if self.stats.should_record_node_sample() {
-                    let mut buf = Vec::new();
-                    encode_partial_path(&self.graph, &mut self.partials, &path, &mut buf)
-                        .map_err(RedbError::from)?;
-                    Some(buf)
-                } else {
-                    None
-                };
-                self.stats
-                    .record_node_path_blob(&file_name, local_id, blob, canonical_bytes);
-                self.database
-                    .add_partial_path(&self.graph, &mut self.partials, path);
+                let local_id = decode_local_id(key.value())?;
+                while let Some(Ok(value)) = values.next() {
+                    cancellation_flag.check("loading node paths")?;
+                    let blob = value.value();
+                    let path = decode_partial_path(blob, &mut this.graph, &mut this.partials)?;
+                    let canonical_bytes = if this.stats.should_record_node_sample() {
+                        let mut buf = Vec::new();
+                        encode_partial_path(&this.graph, &mut this.partials, &path, &mut buf)
+                            .map_err(RedbError::from)?;
+                        Some(buf)
+                    } else {
+                        None
+                    };
+                    this.stats
+                        .record_node_path_blob(&file_name, local_id, blob, canonical_bytes);
+                    this.database
+                        .add_partial_path(&this.graph, &mut this.partials, path);
+                }
+                if let Some(handle) = this.graph.node_for_id(NodeID::new_in_file(file, local_id)) {
+                    this.loaded_node_paths.insert(handle);
+                }
             }
-            if let Some(handle) = self.graph.node_for_id(NodeID::new_in_file(file, local_id)) {
-                self.loaded_node_paths.insert(handle);
-            }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     fn preload_root_paths_for_file(
@@ -364,72 +452,75 @@ impl RedbReader {
         }
         let file_name = self.graph[file].name().to_string();
         let (start, end) = root_file_range_bounds(&file_name);
-        let txn = self.db.begin_read()?;
-        let table = txn.open_multimap_table(ROOT_PATHS_BY_FILE_TABLE)?;
-        let mut iter = table.range(start.as_slice()..=end.as_slice())?;
-        while let Some(Ok((key, mut values))) = iter.next() {
-            cancellation_flag.check("loading root paths")?;
-            let want_sample = self.stats.should_record_root_sample();
-            let symbol_stack_for_sample = if want_sample {
-                Some(decode_root_symbol(key.value())?)
-            } else {
-                None
-            };
-            while let Some(Ok(value)) = values.next() {
+        self.with_read_txn(|txn, this| {
+            let table = txn.open_multimap_table(ROOT_PATHS_BY_FILE_TABLE)?;
+            let mut iter = table.range(start.as_slice()..=end.as_slice())?;
+            while let Some(Ok((key, mut values))) = iter.next() {
                 cancellation_flag.check("loading root paths")?;
-                let blob = value.value();
-                let path = decode_partial_path(blob, &mut self.graph, &mut self.partials)?;
-                let canonical_bytes = if want_sample {
-                    let mut buf = Vec::new();
-                    encode_partial_path(&self.graph, &mut self.partials, &path, &mut buf)
-                        .map_err(RedbError::from)?;
-                    Some(buf)
+                let want_sample = this.stats.should_record_root_sample();
+                let symbol_stack_for_sample = if want_sample {
+                    Some(decode_root_symbol(key.value())?)
                 } else {
                     None
                 };
-                self.stats.record_root_path_blob(
-                    &file_name,
-                    symbol_stack_for_sample.as_deref(),
-                    blob,
-                    canonical_bytes,
-                );
-                let handles = path.symbol_stack_precondition.storage_key_queries(
-                    &self.graph,
-                    &mut self.partials,
-                    &mut self.symbol_stack_queries,
-                );
-                for handle in handles {
-                    let key = self.symbol_stack_queries.get_key(handle);
-                    if matches!(
-                        key,
-                        SymbolStackQueryKey::Exact {
-                            variant: SymbolStackExactVariant::FullStack,
-                            ..
+                while let Some(Ok(value)) = values.next() {
+                    cancellation_flag.check("loading root paths")?;
+                    let blob = value.value();
+                    let path = decode_partial_path(blob, &mut this.graph, &mut this.partials)?;
+                    let canonical_bytes = if want_sample {
+                        let mut buf = Vec::new();
+                        encode_partial_path(&this.graph, &mut this.partials, &path, &mut buf)
+                            .map_err(RedbError::from)?;
+                        Some(buf)
+                    } else {
+                        None
+                    };
+                    this.stats.record_root_path_blob(
+                        &file_name,
+                        symbol_stack_for_sample.as_deref(),
+                        blob,
+                        canonical_bytes,
+                    );
+                    let handles = path.symbol_stack_precondition.storage_key_queries(
+                        &this.graph,
+                        &mut this.partials,
+                        &mut this.symbol_stack_queries,
+                    );
+                    for handle in handles {
+                        let key = this.symbol_stack_queries.get_key(handle);
+                        if matches!(
+                            key,
+                            SymbolStackQueryKey::Exact {
+                                variant: SymbolStackExactVariant::FullStack,
+                                ..
+                            }
+                        ) {
+                            this.loaded_root_paths.insert(handle);
                         }
-                    ) {
-                        self.loaded_root_paths.insert(handle);
                     }
+                    this.database
+                        .add_partial_path(&this.graph, &mut this.partials, path);
                 }
-                self.database
-                    .add_partial_path(&self.graph, &mut self.partials, path);
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     fn files_with_exact_root_symbol_stack(
-        &self,
+        &mut self,
         key: &str,
         cancellation_flag: &dyn CancellationFlag,
     ) -> Result<Vec<String>> {
-        let txn = self.db.begin_read()?;
-        let table = txn.open_multimap_table(ROOT_PATHS_BY_SYMBOL_TABLE)?;
-        let mut iter = table.get(key)?;
         let mut files: Vec<String> = Vec::new();
-        while let Some(Ok(file)) = iter.next() {
-            cancellation_flag.check("loading root paths")?;
-            files.push(file.value().to_string());
-        }
+        self.with_read_txn(|txn, _this| {
+            let table = txn.open_multimap_table(ROOT_PATHS_BY_SYMBOL_TABLE)?;
+            let mut iter = table.get(key)?;
+            while let Some(Ok(file)) = iter.next() {
+                cancellation_flag.check("loading root paths")?;
+                files.push(file.value().to_string());
+            }
+            Ok(())
+        })?;
         files.sort();
         files.dedup();
         Ok(files)
@@ -492,11 +583,10 @@ impl RedbReader {
         end: &str,
         cancellation_flag: &dyn CancellationFlag,
     ) -> Result<()> {
-        let mut files: Vec<String> = {
-            let txn = self.db.begin_read()?;
+        let mut files: Vec<String> = Vec::new();
+        self.with_read_txn(|txn, _this| {
             let table = txn.open_multimap_table(ROOT_PATHS_BY_SYMBOL_TABLE)?;
             let mut range = table.range(start..end)?;
-            let mut files = Vec::new();
             while let Some(Ok((_, mut values))) = range.next() {
                 cancellation_flag.check("loading root paths")?;
                 while let Some(Ok(value)) = values.next() {
@@ -504,8 +594,8 @@ impl RedbReader {
                     files.push(value.value().to_string());
                 }
             }
-            files
-        };
+            Ok(())
+        })?;
         files.sort();
         files.dedup();
         for file in files {
@@ -550,11 +640,11 @@ impl RedbReader {
 impl StorageReader for RedbReader {
     type Error = RedbError;
     type ListAll<'a>
-        = RedbFileListing<'a>
+        = RedbFileListing
     where
         Self: 'a;
     type ListByPath<'a>
-        = RedbFileListing<'a>
+        = RedbFileListing
     where
         Self: 'a;
 
@@ -789,7 +879,7 @@ impl RedbWriter {
     }
 
     pub fn status_for_file(&mut self, file: &str, tag: Option<&str>) -> Result<FileStatus> {
-        if let Some(record) = read_graph_record(&self.db, file)? {
+        if let Some(record) = read_graph_record_generic(&self.db, file)? {
             if let Some(expected) = tag {
                 if record.tag != expected {
                     return Ok(FileStatus::Missing);
@@ -1047,14 +1137,17 @@ impl StorageWriter for RedbWriter {
     }
 }
 
-pub struct RedbFileListing<'a> {
-    db: &'a RedbDatabase,
+pub struct RedbFileListing {
+    db: DbHandle,
     directory: Option<PathBuf>,
 }
 
-impl<'a> RedbFileListing<'a> {
-    fn new(db: &'a RedbDatabase, directory: Option<PathBuf>) -> Result<Self> {
-        Ok(Self { db, directory })
+impl RedbFileListing {
+    fn new(db: &DbHandle, directory: Option<PathBuf>) -> Result<Self> {
+        Ok(Self {
+            db: db.clone(),
+            directory,
+        })
     }
 
     fn collect_entries(&self) -> Result<Vec<FileEntry>> {
@@ -1097,7 +1190,7 @@ impl Iterator for RedbFileEntries {
     }
 }
 
-impl<'a> StorageFileListing<'a> for RedbFileListing<'a> {
+impl<'a> StorageFileListing<'a> for RedbFileListing {
     type Error = RedbError;
     type Iter = RedbFileEntries;
 
