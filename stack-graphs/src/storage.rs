@@ -498,11 +498,19 @@ impl SQLiteWriter {
         IP: IntoIterator<Item = &'a PartialPath>,
     {
         let path = Path::new(graph[file].name());
-        let tx = self.conn.transaction()?;
-        Self::clean_file_inner(&tx, path)?;
-        Self::store_graph_for_file_inner(&tx, graph, file, tag, &mut self.buf, &mut self.stats)?;
+        // The writer is ALREADY in a transaction. We will operate directly on the connection.
+
+        Self::clean_file_inner(&self.conn, path)?;
+        Self::store_graph_for_file_inner(
+            &self.conn,
+            graph,
+            file,
+            tag,
+            &mut self.buf,
+            &mut self.stats,
+        )?;
         Self::store_partial_paths_for_file_inner(
-            &tx,
+            &self.conn,
             graph,
             file,
             partials,
@@ -510,7 +518,7 @@ impl SQLiteWriter {
             &mut self.buf,
             &mut self.stats,
         )?;
-        tx.commit()?;
+
         Ok(())
     }
 

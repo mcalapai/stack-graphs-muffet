@@ -72,6 +72,26 @@ pub(crate) fn decode_partial_path(
     })
 }
 
+pub(crate) fn validate_partial_path_blob(blob: &[u8]) -> Result<(), StorageError> {
+    let mut cursor = BlobCursor::new(blob);
+    let version = cursor.read_u8()?;
+    if version != RECORD_VERSION {
+        return Err(StorageError::Corrupt(format!(
+            "unsupported partial path record version {version}"
+        )));
+    }
+
+    cursor.skip_node_id()?; // start node
+    cursor.skip_node_id()?; // end node
+    cursor.skip_symbol_stack()?; // precondition
+    cursor.skip_symbol_stack()?; // postcondition
+    cursor.skip_scope_stack()?; // scope precondition
+    cursor.skip_scope_stack()?; // scope postcondition
+    cursor.skip_edge_list()?;
+    cursor.ensure_finished()?;
+    Ok(())
+}
+
 fn encode_node_id(buf: &mut Vec<u8>, id: NodeID, graph: &StackGraph) -> Result<(), StorageError> {
     if id.is_root() {
         buf.push(0);
@@ -177,6 +197,136 @@ fn resolve_node_handle(graph: &mut StackGraph, id: NodeID) -> Result<Handle<Node
 struct Decoder<'a> {
     data: &'a [u8],
     offset: usize,
+}
+
+struct BlobCursor<'a> {
+    data: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> BlobCursor<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, offset: 0 }
+    }
+
+    fn read_u8(&mut self) -> Result<u8, StorageError> {
+        if self.offset >= self.data.len() {
+            return Err(StorageError::Corrupt("unexpected end of record".into()));
+        }
+        let value = self.data[self.offset];
+        self.offset += 1;
+        Ok(value)
+    }
+
+    fn read_u32(&mut self) -> Result<u32, StorageError> {
+        if self.remaining() < size_of::<u32>() {
+            return Err(StorageError::Corrupt("unexpected end of record".into()));
+        }
+        let mut bytes = [0u8; 4];
+        bytes.copy_from_slice(&self.data[self.offset..self.offset + 4]);
+        self.offset += 4;
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn read_i32(&mut self) -> Result<i32, StorageError> {
+        if self.remaining() < size_of::<i32>() {
+            return Err(StorageError::Corrupt("unexpected end of record".into()));
+        }
+        let mut bytes = [0u8; 4];
+        bytes.copy_from_slice(&self.data[self.offset..self.offset + 4]);
+        self.offset += 4;
+        Ok(i32::from_le_bytes(bytes))
+    }
+
+    fn read_str(&mut self) -> Result<(), StorageError> {
+        let len = self.read_u32()? as usize;
+        if self.remaining() < len {
+            return Err(StorageError::Corrupt("unexpected end of record".into()));
+        }
+        self.offset += len;
+        Ok(())
+    }
+
+    fn skip_node_id(&mut self) -> Result<(), StorageError> {
+        match self.read_u8()? {
+            0 | 1 => Ok(()),
+            2 => {
+                self.read_str()?;
+                self.read_u32()?;
+                Ok(())
+            }
+            tag => Err(StorageError::Corrupt(format!(
+                "invalid node kind tag {tag}"
+            ))),
+        }
+    }
+
+    fn skip_symbol_stack(&mut self) -> Result<(), StorageError> {
+        match self.read_u8()? {
+            0 => {}
+            1 => {
+                self.read_u32()?;
+            }
+            tag => {
+                return Err(StorageError::Corrupt(format!(
+                    "invalid symbol stack variable tag {tag}"
+                )))
+            }
+        }
+        let count = self.read_u32()? as usize;
+        for _ in 0..count {
+            self.read_str()?;
+            match self.read_u8()? {
+                0 => {}
+                1 => self.skip_scope_stack()?,
+                tag => {
+                    return Err(StorageError::Corrupt(format!(
+                        "invalid scoped symbol flag {tag}"
+                    )))
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn skip_scope_stack(&mut self) -> Result<(), StorageError> {
+        match self.read_u8()? {
+            0 => {}
+            1 => {
+                self.read_u32()?;
+            }
+            tag => {
+                return Err(StorageError::Corrupt(format!(
+                    "invalid scope stack variable tag {tag}"
+                )))
+            }
+        }
+        let count = self.read_u32()? as usize;
+        for _ in 0..count {
+            self.skip_node_id()?;
+        }
+        Ok(())
+    }
+
+    fn skip_edge_list(&mut self) -> Result<(), StorageError> {
+        let count = self.read_u32()? as usize;
+        for _ in 0..count {
+            self.skip_node_id()?;
+            self.read_i32()?;
+        }
+        Ok(())
+    }
+
+    fn ensure_finished(&self) -> Result<(), StorageError> {
+        if self.offset != self.data.len() {
+            return Err(StorageError::Corrupt("unexpected trailing data".into()));
+        }
+        Ok(())
+    }
+
+    fn remaining(&self) -> usize {
+        self.data.len() - self.offset
+    }
 }
 
 impl<'a> Decoder<'a> {

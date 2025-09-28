@@ -16,9 +16,9 @@ use std::sync::Arc;
 use bincode::error::DecodeError;
 use redb::backends::InMemoryBackend;
 use redb::{
-    CommitError, Database as RedbDatabase, DatabaseError, MultimapTableDefinition,
+    CommitError, Database as RedbDatabase, DatabaseError, MultimapTable, MultimapTableDefinition,
     ReadOnlyDatabase, ReadTransaction, ReadableDatabase, ReadableMultimapTable, ReadableTable,
-    StorageError as RedbStorageError, TableDefinition, TableError, TransactionError,
+    StorageError as RedbStorageError, Table, TableDefinition, TableError, TransactionError,
     WriteTransaction,
 };
 use rusqlite::Connection;
@@ -33,7 +33,7 @@ use crate::serde;
 use crate::serde::FileFilter;
 use crate::{CancellationError, CancellationFlag};
 
-use super::encoding::{decode_partial_path, encode_partial_path};
+use super::encoding::{decode_partial_path, encode_partial_path, validate_partial_path_blob};
 use super::{
     Database, FileEntry, FileStatus, Stats, StorageComponents, StorageError, StorageFileListing,
     StorageReader, StorageWriter, SymbolStackExactVariant, SymbolStackQuery,
@@ -420,7 +420,21 @@ impl RedbReader {
                 while let Some(Ok(value)) = values.next() {
                     cancellation_flag.check("loading node paths")?;
                     let blob = value.value();
-                    let path = decode_partial_path(blob, &mut this.graph, &mut this.partials)?;
+                    let path = match decode_partial_path(blob, &mut this.graph, &mut this.partials)
+                    {
+                        Ok(path) => path,
+                        Err(err) => {
+                            let msg = format!(
+                                "failed decoding node path for {} local_id {} ({} bytes): {}",
+                                &file_name,
+                                local_id,
+                                blob.len(),
+                                err
+                            );
+                            crate::copious_debugging!("{}", msg);
+                            return Err(RedbError::Corrupt(msg));
+                        }
+                    };
                     let canonical_bytes = if this.stats.should_record_node_sample() {
                         let mut buf = Vec::new();
                         encode_partial_path(&this.graph, &mut this.partials, &path, &mut buf)
@@ -457,16 +471,31 @@ impl RedbReader {
             let mut iter = table.range(start.as_slice()..=end.as_slice())?;
             while let Some(Ok((key, mut values))) = iter.next() {
                 cancellation_flag.check("loading root paths")?;
+                let symbol_stack = decode_root_symbol(key.value())?;
                 let want_sample = this.stats.should_record_root_sample();
                 let symbol_stack_for_sample = if want_sample {
-                    Some(decode_root_symbol(key.value())?)
+                    Some(symbol_stack.clone())
                 } else {
                     None
                 };
                 while let Some(Ok(value)) = values.next() {
                     cancellation_flag.check("loading root paths")?;
                     let blob = value.value();
-                    let path = decode_partial_path(blob, &mut this.graph, &mut this.partials)?;
+                    let path = match decode_partial_path(blob, &mut this.graph, &mut this.partials)
+                    {
+                        Ok(path) => path,
+                        Err(err) => {
+                            let msg = format!(
+                                "failed decoding root path for {} symbol {} ({} bytes): {}",
+                                &file_name,
+                                &symbol_stack,
+                                blob.len(),
+                                err
+                            );
+                            crate::copious_debugging!("{}", msg);
+                            return Err(RedbError::Corrupt(msg));
+                        }
+                    };
                     let canonical_bytes = if want_sample {
                         let mut buf = Vec::new();
                         encode_partial_path(&this.graph, &mut this.partials, &path, &mut buf)
@@ -732,21 +761,38 @@ impl StorageReader for RedbReader {
 }
 
 pub struct RedbWriter {
-    db: RedbDatabase,
+    // RESTORED: We need to keep a handle to the database.
+    db: Arc<RedbDatabase>,
+    txn: Option<WriteTransaction>,
     graph_buf: Vec<u8>,
     path_buf: Vec<u8>,
     stats: WriteStats,
+    committed: bool,
+}
+// ADDED: Implement Drop for RAII-style transaction management.
+impl Drop for RedbWriter {
+    fn drop(&mut self) {
+        if !self.committed {
+            if let Some(txn) = self.txn.take() {
+                // If the writer is dropped without commit, abort the transaction.
+                let _ = txn.abort();
+            }
+        }
+    }
 }
 
 impl RedbWriter {
     pub fn open_in_memory() -> Result<Self> {
-        let db = RedbDatabase::builder().create_with_backend(InMemoryBackend::new())?;
+        let db = Arc::new(RedbDatabase::builder().create_with_backend(InMemoryBackend::new())?);
         ensure_metadata_initialized(&db)?;
+        let txn = db.begin_write()?;
         Ok(Self {
-            db,
+            db, // Store the Arc'd handle
+            txn: Some(txn),
             graph_buf: Vec::new(),
             path_buf: Vec::new(),
             stats: WriteStats::default(),
+            committed: false,
         })
     }
 
@@ -755,49 +801,62 @@ impl RedbWriter {
         if let Some(parent) = path_ref.parent() {
             fs::create_dir_all(parent)?;
         }
-        let db = if path_ref.exists() {
-            let db = RedbDatabase::open(path_ref)?;
-            ensure_metadata_initialized(&db)?;
-            db
-        } else {
-            let db = RedbDatabase::create(path_ref)?;
-            ensure_metadata_initialized(&db)?;
-            db
-        };
+        let db = Arc::new(RedbDatabase::create(path_ref)?);
+        ensure_metadata_initialized(&db)?;
+        let txn = db.begin_write()?;
         Ok(Self {
-            db,
+            db, // Store the Arc'd handle
+            txn: Some(txn),
             graph_buf: Vec::new(),
             path_buf: Vec::new(),
             stats: WriteStats::default(),
+            committed: false,
         })
     }
 
+    // ADDED: An explicit commit method.
+    pub fn commit(&mut self) -> Result<()> {
+        if let Some(txn) = self.txn.take() {
+            txn.commit()?;
+            self.committed = true;
+        }
+        // If txn is None, it was already committed or aborted, so do nothing.
+        Ok(())
+    }
+
     pub fn clean_all(&mut self) -> Result<usize> {
-        let mut txn = self.db.begin_write()?;
-        let count = Self::clean_all_inner(&mut txn)?;
-        txn.commit()?;
+        let txn = self.txn.as_mut().ok_or_else(|| {
+            RedbError::Corrupt("Cannot clean_all on a committed or closed writer".into())
+        })?;
+        let count = Self::clean_all_inner(txn)?;
         Ok(count)
     }
 
     pub fn clean_file(&mut self, file: &Path) -> Result<usize> {
-        let mut txn = self.db.begin_write()?;
+        let txn = self.txn.as_mut().ok_or_else(|| {
+            RedbError::Corrupt("Cannot clean_file on a committed or closed writer".into())
+        })?;
         let file_name = file.to_string_lossy().to_string();
-        let count = Self::clean_file_inner(&mut txn, &file_name)?;
-        txn.commit()?;
+        let count = Self::clean_file_inner(txn, &file_name)?;
         Ok(count)
     }
 
     pub fn clean_file_or_directory(&mut self, file_or_directory: &Path) -> Result<usize> {
-        let mut txn = self.db.begin_write()?;
-        let count = Self::clean_file_or_directory_inner(&mut txn, file_or_directory)?;
-        txn.commit()?;
+        let txn = self.txn.as_mut().ok_or_else(|| {
+            RedbError::Corrupt(
+                "Cannot clean_file_or_directory on a committed or closed writer".into(),
+            )
+        })?;
+        let count = Self::clean_file_or_directory_inner(txn, file_or_directory)?;
         Ok(count)
     }
 
     pub fn store_error_for_file(&mut self, file: &Path, tag: &str, error: &str) -> Result<()> {
-        let mut txn = self.db.begin_write()?;
+        let txn = self.txn.as_mut().ok_or_else(|| {
+            RedbError::Corrupt("Cannot store_error_for_file on a committed or closed writer".into())
+        })?;
         let file_name = file.to_string_lossy().to_string();
-        Self::clean_file_inner(&mut txn, &file_name)?;
+        Self::clean_file_inner(txn, &file_name)?;
         {
             let mut graphs = txn.open_table(GRAPHS_TABLE)?;
             let graph = crate::serde::StackGraph::default();
@@ -806,10 +865,10 @@ impl RedbWriter {
                 .map_err(RedbError::from)?;
             let encoded = GraphRecord::encode(tag, Some(error), serialized);
             graphs.insert(file_name.as_str(), encoded.as_slice())?;
+            verify_graph_round_trip(&mut graphs, file_name.as_str(), tag, Some(error))?;
             self.stats
                 .record_graph_write(file_name.as_str(), tag, encoded.as_slice());
         }
-        txn.commit()?;
         Ok(())
     }
 
@@ -824,9 +883,17 @@ impl RedbWriter {
     where
         IP: IntoIterator<Item = &'a PartialPath>,
     {
-        let mut txn = self.db.begin_write()?;
+        // MODIFIED: Get a mutable reference to the transaction.
+        let txn = self
+            .txn
+            .as_mut()
+            .ok_or_else(|| RedbError::Corrupt("Transaction already closed".to_string()))?;
+
         let file_name = graph[file].name().to_string();
-        Self::clean_file_inner(&mut txn, &file_name)?;
+        Self::clean_file_inner(txn, &file_name)?;
+
+        // The rest of this method's logic is correct, but it must operate on `txn`
+        // instead of creating its own.
         {
             let mut graphs = txn.open_table(GRAPHS_TABLE)?;
             let graph_value = serde::StackGraph::from_graph_filter(graph, &FileFilter(file));
@@ -851,6 +918,14 @@ impl RedbWriter {
                     let symbol_stack = path.symbol_stack_precondition.storage_key(graph, partials);
                     let key = encode_root_key(file_name.as_str(), &symbol_stack);
                     root_by_file.insert(key.as_slice(), serialized)?;
+                    let context =
+                        format!("root_paths_by_file(symbol_stack={})", symbol_stack.as_str());
+                    verify_partial_path_round_trip(
+                        &mut root_by_file,
+                        key.as_slice(),
+                        file_name.as_str(),
+                        &context,
+                    )?;
                     root_by_symbol.insert(symbol_stack.as_str(), file_name.as_str())?;
                     self.stats.record_root_path_write(
                         file_name.as_str(),
@@ -860,6 +935,13 @@ impl RedbWriter {
                 } else if start_node.is_in_file(file) {
                     let key = encode_node_key(file_name.as_str(), start_node.local_id());
                     node_table.insert(key.as_slice(), serialized)?;
+                    let context = format!("file_paths(local_id={})", start_node.local_id());
+                    verify_partial_path_round_trip(
+                        &mut node_table,
+                        key.as_slice(),
+                        file_name.as_str(),
+                        &context,
+                    )?;
                     self.stats.record_node_path_write(
                         file_name.as_str(),
                         start_node.local_id(),
@@ -874,12 +956,12 @@ impl RedbWriter {
                 }
             }
         }
-        txn.commit()?;
         Ok(())
     }
 
     pub fn status_for_file(&mut self, file: &str, tag: Option<&str>) -> Result<FileStatus> {
-        if let Some(record) = read_graph_record_generic(&self.db, file)? {
+        // Use `self.db.as_ref()` to pass a `&RedbDatabase` instead of `&Arc<RedbDatabase>`.
+        if let Some(record) = read_graph_record_generic(self.db.as_ref(), file)? {
             if let Some(expected) = tag {
                 if record.tag != expected {
                     return Ok(FileStatus::Missing);
@@ -894,8 +976,13 @@ impl RedbWriter {
         }
     }
 
-    pub fn into_reader(self) -> Result<RedbReader> {
-        RedbReader::from_database(self.db)
+    pub fn into_reader(mut self) -> Result<RedbReader> {
+        // Commit any pending transaction before converting to a reader.
+        self.commit()?;
+
+        // Use from_shared_database because self.db is an Arc.
+        // CLONE the Arc to pass ownership to the new reader.
+        RedbReader::from_shared_database(self.db.clone())
     }
 
     fn clean_all_inner(txn: &mut WriteTransaction) -> Result<usize> {
@@ -1249,6 +1336,92 @@ impl GraphRecord {
         write_u32(&mut buf, graph_blob.len() as u32);
         buf.extend_from_slice(graph_blob);
         buf
+    }
+}
+
+fn verify_graph_round_trip(
+    graphs: &mut Table<&str, &[u8]>,
+    file_name: &str,
+    expected_tag: &str,
+    expected_error: Option<&str>,
+) -> Result<()> {
+    let stored = graphs.get(file_name)?.ok_or_else(|| {
+        RedbError::Corrupt(format!("graph missing after insert for {}", file_name))
+    })?;
+    let value = stored.value();
+    match GraphRecord::decode(value) {
+        Ok(record) => {
+            debug_assert_eq!(
+                record.tag, expected_tag,
+                "graph tag mismatch after insert for {}",
+                file_name
+            );
+            debug_assert_eq!(
+                record.error.as_deref(),
+                expected_error,
+                "graph error mismatch after insert for {}",
+                file_name
+            );
+            crate::copious_debugging!(
+                "redb round-trip ok for {} (tag={}, error={:?}, bytes={})",
+                file_name,
+                expected_tag,
+                expected_error,
+                value.len()
+            );
+            Ok(())
+        }
+        Err(err) => {
+            crate::copious_debugging!(
+                "redb round-trip decode failed for {}: {:?} ({} bytes)",
+                file_name,
+                err,
+                value.len()
+            );
+            Err(err)
+        }
+    }
+}
+
+fn verify_partial_path_round_trip(
+    table: &mut MultimapTable<&[u8], &[u8]>,
+    key: &[u8],
+    file_name: &str,
+    context: &str,
+) -> Result<()> {
+    let mut values = table.get(key)?;
+    let mut seen = false;
+    let mut sample_len = None;
+    while let Some(value) = values.next() {
+        let value = value?;
+        let blob = value.value();
+        if let Err(err) = validate_partial_path_blob(blob) {
+            crate::copious_debugging!(
+                "redb partial round-trip decode failed for {} {}: {:?} ({} bytes)",
+                file_name,
+                context,
+                err,
+                blob.len()
+            );
+            return Err(RedbError::from(err));
+        }
+        seen = true;
+        if sample_len.is_none() {
+            sample_len = Some(blob.len());
+        }
+    }
+    if seen {
+        crate::copious_debugging!(
+            "redb partial round-trip ok for {} {} ({} bytes)",
+            file_name,
+            context,
+            sample_len.unwrap_or_default()
+        );
+        Ok(())
+    } else {
+        Err(RedbError::Corrupt(format!(
+            "{context} empty after insert for {file_name}"
+        )))
     }
 }
 
