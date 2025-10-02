@@ -814,7 +814,24 @@ impl RedbWriter {
         })
     }
 
-    // ADDED: An explicit commit method.
+    /// Creates a new writer from an existing, shared database handle.
+    ///
+    /// This is the preferred way to create a writer when the database is already
+    /// managed by the application, as it avoids attempting to open the database
+    /// file a second time within the same process.
+    pub fn from_shared_database(db: Arc<RedbDatabase>) -> Result<Self> {
+        // The database is assumed to be initialized, as the caller already holds a handle.
+        let txn = db.begin_write()?;
+        Ok(Self {
+            db, // Store the provided shared handle
+            txn: Some(txn),
+            graph_buf: Vec::new(),
+            path_buf: Vec::new(),
+            stats: WriteStats::default(),
+            committed: false,
+        })
+    }
+
     pub fn commit(&mut self) -> Result<()> {
         if let Some(txn) = self.txn.take() {
             txn.commit()?;
