@@ -15,3 +15,5 @@ Cargo.lock
 .vscode
 AGENTS.md
 docs
+scripts
+out
