@@ -163,6 +163,12 @@ pub struct SQLiteWriter {
     buf: Vec<u8>,
 }
 
+// 1. New transaction wrapper struct
+pub struct SQLiteTransaction<'a> {
+    tx: rusqlite::Transaction<'a>,
+    buf: &'a mut Vec<u8>,
+}
+
 impl SQLiteWriter {
     /// Open an in-memory database.
     pub fn open_in_memory() -> Result<Self> {
@@ -431,6 +437,16 @@ impl SQLiteWriter {
         status_for_file(&self.conn, file, tag)
     }
 
+    /// Begin a transaction for batching multiple file writes.
+    /// Call `store_result_for_file` on the returned transaction, then `commit()`.
+    pub fn begin_transaction(&mut self) -> Result<SQLiteTransaction<'_>> {
+        let tx = self.conn.transaction()?;
+        Ok(SQLiteTransaction {
+            tx,
+            buf: &mut self.buf,
+        })
+    }
+
     /// Convert this writer into a reader for the same database.
     pub fn into_reader(self) -> SQLiteReader {
         SQLiteReader {
@@ -446,6 +462,36 @@ impl SQLiteWriter {
             stats: Stats::default(),
             symbol_stack_queries: SymbolStackQueryPool::new(),
         }
+    }
+}
+
+impl<'a> SQLiteTransaction<'a> {
+    /// Store the result of a successful file index within this transaction.
+    /// Does not commit - call `commit()` after storing all files.
+    pub fn store_result_for_file<'b, IP>(
+        &mut self,
+        graph: &StackGraph,
+        file: Handle<File>,
+        tag: &str,
+        partials: &mut PartialPaths,
+        paths: IP,
+    ) -> Result<()>
+    where
+        IP: IntoIterator<Item = &'b PartialPath>,
+    {
+        let path = Path::new(graph[file].name());
+        SQLiteWriter::clean_file_inner(&self.tx, path)?;
+        SQLiteWriter::store_graph_for_file_inner(&self.tx, graph, file, tag, self.buf)?;
+        SQLiteWriter::store_partial_paths_for_file_inner(
+            &self.tx, graph, file, partials, paths, self.buf,
+        )?;
+        Ok(())
+    }
+
+    /// Commit the transaction, persisting all stored files atomically.
+    pub fn commit(self) -> Result<()> {
+        self.tx.commit()?;
+        Ok(())
     }
 }
 
